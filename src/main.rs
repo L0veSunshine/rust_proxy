@@ -1,4 +1,4 @@
-use clap::{Parser};
+use clap::Parser;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
