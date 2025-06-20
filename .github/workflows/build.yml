@@ -1,0 +1,49 @@
+name: build.yml
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build_binary:
+    name: Build Binary
+    runs-on: ${{matrix.os}}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+        rust: [ stable ]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4 # 使用官方的 cache Action
+        with:
+          path: | # 指定需要缓存的路径
+            ~/.cargo/registry
+            ~/.cargo/git
+            target # 缓存 target 目录可以更快地跳过重复编译，但可能会导致问题，慎用。通常只缓存前两个。
+          key: ${{ runner.os }}-cargo-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }} # 缓存的键
+          restore-keys: | # 恢复缓存的键（用于匹配部分键）
+            ${{ runner.os }}-cargo-${{ matrix.rust }}-
+
+      - name: Build project
+        run: cargo build --verbose
+
+      - name: Check formatting
+        # 格式检查只需在其中一个 OS 和 Rust 版本上运行一次
+        if: matrix.os == 'ubuntu-latest' && contains(matrix.rust, 'stable')
+        run: cargo fmt --check
