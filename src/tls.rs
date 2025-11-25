@@ -1,13 +1,13 @@
+use anyhow::{Result, anyhow};
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
-use anyhow::{Result, anyhow};
 
 // 注意：新版 Rustls 将证书类型移到了 pki_types 模块/crate 中
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::client::danger::{ServerCertVerified, ServerCertVerifier, HandshakeSignatureValid};
-use rustls::{ServerConfig, ClientConfig, DigitallySignedStruct};
-use tokio_rustls::{TlsConnector, TlsAcceptor};
+use rustls::{ClientConfig, DigitallySignedStruct, ServerConfig};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 // === 服务端配置 ===
 pub fn create_server_config(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
@@ -15,8 +15,7 @@ pub fn create_server_config(cert_path: &str, key_path: &str) -> Result<TlsAccept
     // rustls-pemfile 2.0 变更为返回 Iterator<Result<Item>>，需要 collect
     let cert_file = File::open(cert_path)?;
     let mut cert_reader = BufReader::new(cert_file);
-    let certs = rustls_pemfile::certs(&mut cert_reader)
-        .collect::<Result<Vec<_>, _>>()?;
+    let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
 
     // 2. 读取私钥
     // rustls-pemfile 2.0 提供了 private_key() 帮助函数，自动识别 PKCS8/RSA/SEC1 格式

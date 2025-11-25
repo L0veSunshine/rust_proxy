@@ -1,14 +1,14 @@
-use crate::protocol::utils::{read_packet, write_handshake, write_packet, Command};
 use crate::protocol::socks5;
+use crate::protocol::utils::{Command, read_packet, write_handshake, write_packet};
 use crate::tls;
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc;
 use anyhow::Result;
-use std::sync::Arc;
-use std::convert::TryFrom;
 use bytes::Bytes;
 use rustls::pki_types::ServerName;
+use std::convert::TryFrom;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::mpsc;
 
 pub async fn run(listen: &str, server: &str) -> Result<()> {
     let connector = Arc::new(tls::create_client_config()?);
@@ -25,7 +25,11 @@ pub async fn run(listen: &str, server: &str) -> Result<()> {
     }
 }
 
-async fn handle_conn(mut local: TcpStream, server: String, connector: Arc<tokio_rustls::TlsConnector>) -> Result<()> {
+async fn handle_conn(
+    mut local: TcpStream,
+    server: String,
+    connector: Arc<tokio_rustls::TlsConnector>,
+) -> Result<()> {
     // SOCKS5 握手
     let req = socks5::handshake(&mut local).await?;
 
@@ -50,10 +54,16 @@ async fn handle_conn(mut local: TcpStream, server: String, connector: Arc<tokio_
                 let mut buf = vec![0u8; 4096];
                 loop {
                     let n = local_r.read(&mut buf).await.unwrap_or(0);
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
                     // 使用 Bytes 避免这里再次拷贝
-                    let cmd = Command::Data { payload: Bytes::copy_from_slice(&buf[..n]) };
-                    if write_packet(&mut tls_w, &cmd).await.is_err() { break; }
+                    let cmd = Command::Data {
+                        payload: Bytes::copy_from_slice(&buf[..n]),
+                    };
+                    if write_packet(&mut tls_w, &cmd).await.is_err() {
+                        break;
+                    }
                 }
             });
 
@@ -62,9 +72,11 @@ async fn handle_conn(mut local: TcpStream, server: String, connector: Arc<tokio_
                 let pkt = read_packet(&mut tls_r).await;
                 if let Ok(Command::Data { payload }) = pkt {
                     local_w.write_all(&payload).await?;
-                } else { break; }
+                } else {
+                    break;
+                }
             }
-        },
+        }
         socks5::SocksRequest::Udp => {
             // 发送 UDP Associate 握手
             write_handshake(&mut tls_w, &Command::UdpAssociate).await?;
@@ -98,7 +110,7 @@ async fn handle_conn(mut local: TcpStream, server: String, connector: Arc<tokio_
                         // 假设目标是 8.8.8.8:53
                         let cmd = Command::UdpData {
                             addr: "8.8.8.8:53".to_string(),
-                            payload: Bytes::copy_from_slice(&buf[10..n])
+                            payload: Bytes::copy_from_slice(&buf[10..n]),
                         };
                         let _ = net_tx.send(cmd).await;
                     }
@@ -111,7 +123,9 @@ async fn handle_conn(mut local: TcpStream, server: String, connector: Arc<tokio_
                 if let Ok(Command::UdpData { addr: _, payload }) = pkt {
                     // 封装 SOCKS5 头回传 (省略)
                     udp.send_to(&payload, "127.0.0.1:1234").await.ok();
-                } else { break; }
+                } else {
+                    break;
+                }
             }
         }
     }
