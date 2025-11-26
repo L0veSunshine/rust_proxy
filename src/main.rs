@@ -14,14 +14,14 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Mode {
     Server {
-        #[arg(long, default_value = "0.0.0.0:4433")]
-        listen: String,
+        #[arg(long, default_value_t = 4433)]
+        port: u16,
     },
     Client {
         #[arg(long, default_value = "127.0.0.1:1080")]
-        listen: String,
+        local: String,
         #[arg(long, default_value = "127.0.0.1:4433")]
-        server: String,
+        remote: String,
     },
 }
 
@@ -29,7 +29,7 @@ enum Mode {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.mode {
-        Mode::Server { listen } => server::run(&listen).await,
-        Mode::Client { listen, server } => client::run(&listen, &server).await,
+        Mode::Server { port } => server::run(port).await,
+        Mode::Client { local, remote } => client::run(&local, &remote).await,
     }
 }
