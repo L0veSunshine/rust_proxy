@@ -48,7 +48,7 @@ jobs:
       - name: Lint with Clippy
         # 静态检查只需在其中一个 OS 和 Rust 版本上运行一次
         if: matrix.os == 'ubuntu-latest' && contains(matrix.rust, 'stable')
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --no-deps -- -D warnings
 
       - name: Build project
         run: cargo build --verbose

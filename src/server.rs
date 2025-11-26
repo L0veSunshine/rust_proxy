@@ -59,12 +59,8 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
 
             // 客户端 -> 代理 -> 目标
             tokio::spawn(async move {
-                loop {
-                    if let Ok(Command::Data { payload }) = read_packet(&mut client_reader).await {
-                        target_w.write_all(&payload).await.ok();
-                    } else {
-                        break;
-                    }
+                while let Ok(Command::Data { payload }) = read_packet(&mut client_reader).await {
+                    target_w.write_all(&payload).await.ok();
                 }
             });
         }
@@ -90,14 +86,10 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
             // 客户端 -> 代理 -> 外部
             let sock_send = socket.clone();
             tokio::spawn(async move {
-                loop {
-                    if let Ok(Command::UdpData { addr, payload }) =
-                        read_packet(&mut client_reader).await
-                    {
-                        sock_send.send_to(&payload, &addr).await.ok();
-                    } else {
-                        break;
-                    }
+                while let Ok(Command::UdpData { addr, payload }) =
+                    read_packet(&mut client_reader).await
+                {
+                    sock_send.send_to(&payload, &addr).await.ok();
                 }
             });
         }
