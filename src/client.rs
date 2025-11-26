@@ -68,14 +68,11 @@ async fn handle_conn(
             });
 
             // 代理 -> 本地
-            loop {
-                let pkt = read_packet(&mut tls_r).await;
-                if let Ok(Command::Data { payload }) = pkt {
-                    local_w.write_all(&payload).await?;
-                } else {
-                    break;
+            tokio::spawn(async move {
+                while let Ok(Command::Data { payload }) = read_packet(&mut tls_r).await {
+                    let _ = local_w.write_all(&payload).await;
                 }
-            }
+            });
         }
         socks5::SocksRequest::Udp => {
             // 发送 UDP Associate 握手
@@ -104,29 +101,23 @@ async fn handle_conn(
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65535];
                 while let Ok((n, _src)) = udp_recv.recv_from(&mut buf).await {
-                    // 解析 SOCKS5 UDP 头，拿到真正的目标地址 (这里简化，假设头占 10 字节)
-                    if n > 10 {
-                        // 这是一个 Demo，实际需要解析 SOCKS5 头
-                        // 假设目标是 8.8.8.8:53
+                    if let Ok((target, payload)) = socks5::parse_udp_packet(&buf[..n]) {
                         let cmd = Command::UdpData {
-                            addr: "8.8.8.8:53".to_string(),
-                            payload: Bytes::copy_from_slice(&buf[10..n]),
+                            addr: target,
+                            payload: Bytes::copy_from_slice(&payload),
                         };
                         let _ = net_tx.send(cmd).await;
-                    }
+                    };
                 }
             });
 
             // 代理 -> 本地 UDP
-            loop {
-                let pkt = read_packet(&mut tls_r).await;
-                if let Ok(Command::UdpData { addr: _, payload }) = pkt {
-                    // 封装 SOCKS5 头回传 (省略)
-                    udp.send_to(&payload, "127.0.0.1:1234").await.ok();
-                } else {
-                    break;
+            tokio::spawn(async move {
+                while let Ok(Command::UdpData { addr: _, payload }) = read_packet(&mut tls_r).await
+                {
+                    let _ = udp.send_to(&payload, "127.0.0.1:1234").await;
                 }
-            }
+            });
         }
     }
     Ok(())
