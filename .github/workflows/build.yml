@@ -53,10 +53,18 @@ jobs:
       - name: Build project
         run: cargo build --release --verbose
 
+      - name: Generate Binary Name
+        shell: bash
+        run: |
+          OS_NAME=$(echo "${{ runner.os }}" | tr '[:upper:]' '[:lower:]')
+          echo "ARTIFACT_NAME=rust_proxy_${OS_NAME}_amd64" >> $GITHUB_ENV
+
       - name: Upload Binary
         if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
-          name: rust_proxy
-          path: target/release/rust_proxy
+          name: ${{ env.ARTIFACT_NAME }}
+          path: |
+            target/release/rust_proxy
+            target/release/rust_proxy.exe
           retention-days: 7
