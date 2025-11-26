@@ -4,8 +4,10 @@ use crate::tls;
 use anyhow::Result;
 use bytes::Bytes;
 use rustls::pki_types::ServerName;
+use socket2::{SockRef, TcpKeepalive};
 use std::convert::TryFrom;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
@@ -13,10 +15,17 @@ use tokio::sync::mpsc;
 pub async fn run(listen: &str, server: &str) -> Result<()> {
     let connector = Arc::new(tls::create_client_config()?);
     let listener = TcpListener::bind(listen).await?;
+    let ka = TcpKeepalive::new()
+        .with_time(Duration::from_secs(60)) // 空闲60秒后开始探测
+        .with_interval(Duration::from_secs(10)) // 探测失败后每10秒重试
+        .with_retries(3); // 重试3次失败则断开
     println!("Client listening on {}", listen);
 
     loop {
         let (socket, _) = listener.accept().await?;
+        let native_socket = SockRef::from(&socket);
+        native_socket.set_tcp_nodelay(true)?;
+        native_socket.set_tcp_keepalive(&ka)?;
         let server = server.to_string();
         let connector = connector.clone();
         tokio::spawn(async move {
@@ -51,7 +60,7 @@ async fn handle_conn(
 
             // 本地 -> 代理
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 4096];
+                let mut buf = vec![0u8; 16384];
                 loop {
                     let n = local_r.read(&mut buf).await.unwrap_or(0);
                     if n == 0 {

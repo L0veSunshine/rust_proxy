@@ -2,19 +2,41 @@ use crate::protocol::utils::{Command, read_handshake, read_packet, write_packet}
 use crate::tls;
 use anyhow::Result;
 use bytes::Bytes;
+use socket2::{Domain, SockRef, Socket, TcpKeepalive, Type};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 
-pub async fn run(listen: &str) -> Result<()> {
+pub async fn run(port: u16) -> Result<()> {
     let acceptor = Arc::new(tls::create_server_config("cert.pem", "key.pem")?);
-    let listener = TcpListener::bind(listen).await?;
-    println!("Server listening on {}", listen);
+    // 1. 创建 IPv6 Socket
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, None)?;
+    // 2. 关闭 IPV6_V6ONLY，允许 IPv4 映射到这个 IPv6 Socket
+    // 这样绑定 [::] 也就同时绑定了 0.0.0.0
+    socket.set_only_v6(false)?;
+    // 3. 设置端口复用 (防止重启报错)
+    socket.set_reuse_address(true)?;
+    // 4. 设置为非阻塞，适配 Tokio
+    socket.set_nonblocking(true)?;
+    // 5. 绑定到 [::]:port (同时覆盖 IPv4 和 IPv6)
+    let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    let listener = TcpListener::from_std(socket.into())?;
+    let ka = TcpKeepalive::new()
+        .with_time(Duration::from_secs(60)) // 空闲60秒后开始探测
+        .with_interval(Duration::from_secs(10)) // 探测失败后每10秒重试
+        .with_retries(3); // 重试3次失败则断开
+    println!("Server listening on [::]:{}", port);
 
     loop {
         let (socket, _) = listener.accept().await?;
+        let native_socket = SockRef::from(&socket);
+        native_socket.set_tcp_nodelay(true)?;
+        native_socket.set_tcp_keepalive(&ka)?;
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_client(socket, acceptor).await {
@@ -42,7 +64,7 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
             // 目标 -> 代理 -> 客户端
             let tx_clone = tx.clone();
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 4096];
+                let mut buf = vec![0u8; 16384];
                 loop {
                     let n = target_r.read(&mut buf).await.unwrap_or(0);
                     if n == 0 {
