@@ -60,7 +60,7 @@ async fn handle_conn(
 
             // 本地 -> 代理
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 4096];
+                let mut buf = vec![0u8; 16384];
                 loop {
                     let n = local_r.read(&mut buf).await.unwrap_or(0);
                     if n == 0 {

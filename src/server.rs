@@ -64,7 +64,7 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
             // 目标 -> 代理 -> 客户端
             let tx_clone = tx.clone();
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 4096];
+                let mut buf = vec![0u8; 16384];
                 loop {
                     let n = target_r.read(&mut buf).await.unwrap_or(0);
                     if n == 0 {
