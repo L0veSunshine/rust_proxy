@@ -27,7 +27,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ matrix.rust }}
-          components: rustfmt
+          components: rustfmt, clippy
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v4 # 使用官方的 cache Action
@@ -40,10 +40,15 @@ jobs:
           restore-keys: | # 恢复缓存的键（用于匹配部分键）
             ${{ runner.os }}-cargo-${{ matrix.rust }}-
 
-      - name: Build project
-        run: cargo build --verbose
-
       - name: Check formatting
         # 格式检查只需在其中一个 OS 和 Rust 版本上运行一次
         if: matrix.os == 'ubuntu-latest' && contains(matrix.rust, 'stable')
         run: cargo fmt --check
+
+      - name: Lint with Clippy
+        # 静态检查只需在其中一个 OS 和 Rust 版本上运行一次
+        if: matrix.os == 'ubuntu-latest' && contains(matrix.rust, 'stable')
+        run: cargo clippy --no-deps -- -D warnings
+
+      - name: Build project
+        run: cargo build --verbose

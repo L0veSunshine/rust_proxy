@@ -1,0 +1,105 @@
+use anyhow::{Result, bail};
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use uuid::Uuid;
+
+pub const UUID: &str = "8edc51f2-1bf8-42a8-9229-b9014738f617";
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum Command {
+    // TCP 请求连接
+    Connect { addr: String },
+    // UDP 开启会话 (Full Cone)
+    UdpAssociate,
+    // TCP 数据
+    Data { payload: Bytes },
+    // UDP 数据 (需要带目标地址)
+    UdpData { addr: String, payload: Bytes },
+}
+
+pub async fn write_handshake<S>(stream: &mut S, cmd: &Command) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    // 1. 写 UUID (身份认证)
+    let uuid = Uuid::parse_str(UUID)?;
+    let uuid_bytes: &[u8; 16] = uuid.as_bytes();
+    stream.write_all(uuid_bytes).await?;
+
+    // 2. 生成随机 Padding (抗特征分析)
+    let padding_len = rand::random_range(16..128);
+    stream.write_u8(padding_len as u8).await?;
+
+    // 3. 写 Padding (全0即可)
+    let zeros = vec![0u8; padding_len as usize];
+    stream.write_all(&zeros).await?;
+
+    // 4. 写实际指令
+    write_packet(stream, cmd).await
+}
+
+/// 普通数据包发送 (Length + Bincode)
+pub async fn write_packet<S>(stream: &mut S, cmd: &Command) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    // 使用 bincode 序列化
+    let body = bincode::serde::encode_to_vec(cmd, bincode::config::standard())?;
+
+    // Length-Prefixed Framing
+    stream.write_u32(body.len() as u32).await?;
+    stream.write_all(&body).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// 读取并验证握手包
+pub async fn read_handshake<S>(stream: &mut S) -> Result<Command>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // 1. 验证 UUID
+    let mut uuid = [0u8; 16];
+    stream.read_exact(&mut uuid).await?;
+    let received_uuid = Uuid::from_bytes(uuid);
+
+    if received_uuid != Uuid::parse_str(UUID)? {
+        bail!("Authentication Failed: Invalid UUID");
+    }
+
+    // 2. 读 Padding 长度
+    let pad_len = stream.read_u8().await?;
+
+    // 3. 跳过 Padding (Discard)
+    if pad_len > 0 {
+        let mut limiter = stream.take(pad_len as u64);
+        let mut sink = io::sink();
+        io::copy(&mut limiter, &mut sink).await?;
+    }
+
+    // 4. 读取指令
+    read_packet(stream).await
+}
+
+/// 普通数据包读取
+pub async fn read_packet<S>(stream: &mut S) -> Result<Command>
+where
+    S: AsyncRead + Unpin,
+{
+    let len = match stream.read_u32().await {
+        Ok(n) => n,
+        Err(_) => bail!("Stream closed"),
+    };
+
+    // 限制最大包大小，防止 OOM 攻击
+    if len > 10 * 1024 * 1024 {
+        bail!("Packet too large");
+    }
+
+    let mut buf = vec![0u8; len as usize];
+    stream.read_exact(&mut buf).await?;
+
+    let (cmd, _) = bincode::serde::decode_from_slice(&buf, bincode::config::standard())?;
+    Ok(cmd)
+}
