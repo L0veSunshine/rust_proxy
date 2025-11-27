@@ -53,7 +53,7 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
     let cmd = read_handshake(&mut stream).await?;
 
     let (mut client_reader, mut client_writer) = tokio::io::split(stream);
-    let (tx, mut rx) = mpsc::channel::<Command>(100);
+    let (tx, mut rx) = mpsc::channel::<Command>(1024);
 
     match cmd {
         // === TCP 模式 ===
@@ -82,7 +82,9 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
             // 客户端 -> 代理 -> 目标
             tokio::spawn(async move {
                 while let Ok(Command::Data { payload }) = read_packet(&mut client_reader).await {
-                    target_w.write_all(&payload).await.ok();
+                    if target_w.write_all(&payload).await.is_err() {
+                        break;
+                    };
                 }
             });
         }
@@ -111,7 +113,9 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                 while let Ok(Command::UdpData { addr, payload }) =
                     read_packet(&mut client_reader).await
                 {
-                    sock_send.send_to(&payload, &addr).await.ok();
+                    if sock_send.send_to(&payload, &addr).await.is_err() {
+                        break;
+                    };
                 }
             });
         }

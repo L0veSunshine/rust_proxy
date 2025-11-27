@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -139,4 +139,55 @@ pub fn parse_udp_packet(data: &[u8]) -> Result<(String, Vec<u8>)> {
     cursor += 2;
     let payload = data[cursor..].to_vec();
     Ok((format!("{}:{}", addr_str, port), payload))
+}
+
+/// 构建 SOCKS5 UDP 数据包 (用于回复客户端)
+/// 格式: RSV(2) | FRAG(1) | ATYP(1) | ADDR | PORT | DATA
+pub fn build_udp_packet(target_addr: &str, data: &[u8]) -> Result<Vec<u8>> {
+    // 预估头部最大长度 (IPv6 16+1+2=19, Domain 255+1+1+2=259) + 数据长度
+    let mut buf = Vec::with_capacity(300 + data.len());
+
+    // RSV
+    buf.extend_from_slice(&[0x00, 0x00]);
+    // FRAG
+    buf.push(0x00);
+
+    // 尝试解析为标准 SocketAddr (IP:Port)
+    if let Ok(addr) = target_addr.parse::<SocketAddr>() {
+        match addr.ip() {
+            std::net::IpAddr::V4(ip) => {
+                buf.push(ATYP_IPV4);
+                buf.extend_from_slice(&ip.octets());
+            }
+            std::net::IpAddr::V6(ip) => {
+                buf.push(ATYP_IPV6);
+                buf.extend_from_slice(&ip.octets());
+            }
+        }
+        buf.extend_from_slice(&addr.port().to_be_bytes());
+    } else {
+        // 如果不是标准 IP 格式，尝试作为 Domain 处理
+        // 格式预期: "domain.com:port" 或 "[::1]:port"(已被上面 cover)
+        // 我们需要找到最后一个冒号来分割 Host 和 Port
+        let (host, port_str) = target_addr
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow!("Invalid address format for UDP response: {}", target_addr))?;
+
+        let port: u16 = port_str
+            .parse()
+            .map_err(|_| anyhow!("Invalid port in address: {}", target_addr))?;
+
+        if host.len() > 255 {
+            bail!("Domain name too long (max 255 bytes): {}", host);
+        }
+
+        buf.push(ATYP_DOMAIN);
+        buf.push(host.len() as u8);
+        buf.extend_from_slice(host.as_bytes());
+        buf.extend_from_slice(&port.to_be_bytes());
+    }
+
+    // Append Payload
+    buf.extend_from_slice(data);
+    Ok(buf)
 }

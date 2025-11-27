@@ -6,19 +6,17 @@ use bytes::Bytes;
 use rustls::pki_types::ServerName;
 use socket2::{SockRef, TcpKeepalive};
 use std::convert::TryFrom;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 pub async fn run(listen: &str, server: &str) -> Result<()> {
     let connector = Arc::new(tls::create_client_config()?);
     let listener = TcpListener::bind(listen).await?;
-    let ka = TcpKeepalive::new()
-        .with_time(Duration::from_secs(60)) // 空闲60秒后开始探测
-        .with_interval(Duration::from_secs(10)) // 探测失败后每10秒重试
-        .with_retries(3); // 重试3次失败则断开
+    let ka = TcpKeepalive::new().with_time(Duration::from_secs(60)); // 空闲60秒后开始探测
     println!("Client listening on {}", listen);
 
     loop {
@@ -77,11 +75,11 @@ async fn handle_conn(
             });
 
             // 代理 -> 本地
-            tokio::spawn(async move {
-                while let Ok(Command::Data { payload }) = read_packet(&mut tls_r).await {
-                    let _ = local_w.write_all(&payload).await;
-                }
-            });
+            while let Ok(Command::Data { payload }) = read_packet(&mut tls_r).await {
+                if local_w.write_all(&payload).await.is_err() {
+                    break;
+                };
+            }
         }
         socks5::SocksRequest::Udp => {
             // 发送 UDP Associate 握手
@@ -89,42 +87,73 @@ async fn handle_conn(
 
             // 绑定本地 UDP
             let udp = UdpSocket::bind("127.0.0.1:0").await?;
-            socks5::send_reply(&mut local, udp.local_addr()?).await?;
+            let local_udp_addr = udp.local_addr()?;
+            socks5::send_reply(&mut local, local_udp_addr).await?;
+
             let udp = Arc::new(udp);
 
-            // 本地 UDP -> 代理
-            let udp_recv = udp.clone();
-            let mut tls_w_clone = tls_w; // 这里的 clone 需要 TlsStream 支持 split 后的引用，简化起见直接 move
-            // 注意：为了同时读写 TLS，通常需要 MPSC。这里简化为直接在 UDP 循环里写 TLS
-            // 但因为 TLS split 的 WriteHalf 不易 clone，我们用 Channel 控制写入
+            // 记录本地应用的来源地址 (IP:Port)
+            // 只要收到该应用的包，就更新这个地址；收到服务端回包，就发往这个地址
+            let client_src = Arc::new(Mutex::new(None::<SocketAddr>));
 
-            // 修正：我们需要一个统一的 Writer Loop
-            let (net_tx, mut net_rx) = mpsc::channel::<Command>(100);
+            // 通道：UDP Recv Loop -> TLS Writer Loop
+            let (net_tx, mut net_rx) = mpsc::channel::<Command>(1024);
 
+            // --- 任务 A: 将 Channel 中的 UDP 请求写入 TLS ---
             tokio::spawn(async move {
                 while let Some(cmd) = net_rx.recv().await {
-                    let _ = write_packet(&mut tls_w_clone, &cmd).await;
+                    if write_packet(&mut tls_w, &cmd).await.is_err() {
+                        break;
+                    };
                 }
             });
 
+            let udp_recv = udp.clone();
+            let client_src_recorder = client_src.clone();
+
+            // --- 任务 B: 接收本地 UDP 数据 -> 转发给 Channel ---
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65535];
-                while let Ok((n, _src)) = udp_recv.recv_from(&mut buf).await {
+                while let Ok((n, src)) = udp_recv.recv_from(&mut buf).await {
+                    {
+                        let mut guard = client_src_recorder.lock().await;
+                        if guard.as_ref() != Some(&src) {
+                            *guard = Some(src);
+                        }
+                    }
+
                     if let Ok((target, payload)) = socks5::parse_udp_packet(&buf[..n]) {
                         let cmd = Command::UdpData {
                             addr: target,
                             payload: Bytes::copy_from_slice(&payload),
                         };
-                        let _ = net_tx.send(cmd).await;
+                        if net_tx.send(cmd).await.is_err() {
+                            break;
+                        }
                     };
                 }
             });
 
-            // 代理 -> 本地 UDP
+            // --- 任务 C (主线程): 接收 TLS 数据 -> 转发回本地 UDP ---
+            let udp_send = udp.clone();
             tokio::spawn(async move {
-                while let Ok(Command::UdpData { addr: _, payload }) = read_packet(&mut tls_r).await
-                {
-                    let _ = udp.send_to(&payload, "127.0.0.1:1234").await;
+                while let Ok(Command::UdpData { addr, payload }) = read_packet(&mut tls_r).await {
+                    // 取出目标地址
+                    let target = { *client_src.lock().await };
+                    if let Some(src) = target {
+                        match socks5::build_udp_packet(&addr, &payload) {
+                            Ok(packet) => {
+                                if udp_send.send_to(&packet, src).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to build UDP packet: {}", e);
+                            }
+                        }
+                    } else {
+                        eprintln!("Dropping packet, no client known yet");
+                    }
                 }
             });
         }
