@@ -1,5 +1,5 @@
 use crate::protocol::socks5;
-use crate::protocol::utils::{Command, read_packet, write_handshake, write_packet};
+use crate::protocol::utils::{Command, NATType, read_packet, write_handshake, write_packet};
 use crate::tls;
 use anyhow::Result;
 use bytes::Bytes;
@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
 
-pub async fn run(listen: &str, server: &str) -> Result<()> {
+pub async fn run(listen: &str, server: &str, nattype: NATType) -> Result<()> {
     let connector = Arc::new(tls::create_client_config()?);
     let listener = TcpListener::bind(listen).await?;
     let ka = TcpKeepalive::new().with_time(Duration::from_secs(60)); // 空闲60秒后开始探测
@@ -27,7 +27,7 @@ pub async fn run(listen: &str, server: &str) -> Result<()> {
         let server = server.to_string();
         let connector = connector.clone();
         tokio::spawn(async move {
-            let _ = handle_conn(socket, server, connector).await;
+            let _ = handle_conn(socket, server, connector, nattype).await;
         });
     }
 }
@@ -36,6 +36,7 @@ async fn handle_conn(
     mut local: TcpStream,
     server: String,
     connector: Arc<tokio_rustls::TlsConnector>,
+    nattype: NATType,
 ) -> Result<()> {
     // SOCKS5 握手
     let req = socks5::handshake(&mut local).await?;
@@ -83,7 +84,7 @@ async fn handle_conn(
         }
         socks5::SocksRequest::Udp => {
             // 发送 UDP Associate 握手
-            write_handshake(&mut tls_w, &Command::UdpAssociate).await?;
+            write_handshake(&mut tls_w, &Command::UdpAssociate { nat_type: nattype }).await?;
 
             // 绑定本地 UDP
             let udp = UdpSocket::bind("127.0.0.1:0").await?;
@@ -122,9 +123,10 @@ async fn handle_conn(
                         }
                     }
 
-                    if let Ok((target, payload)) = socks5::parse_udp_packet(&buf[..n]) {
+                    if let Ok((target, port, payload)) = socks5::parse_udp_packet(&buf[..n]) {
                         let cmd = Command::UdpData {
                             addr: target,
+                            port,
                             payload: Bytes::copy_from_slice(&payload),
                         };
                         if net_tx.send(cmd).await.is_err() {
@@ -137,7 +139,12 @@ async fn handle_conn(
             // --- 任务 C (主线程): 接收 TLS 数据 -> 转发回本地 UDP ---
             let udp_send = udp.clone();
             tokio::spawn(async move {
-                while let Ok(Command::UdpData { addr, payload }) = read_packet(&mut tls_r).await {
+                while let Ok(Command::UdpData {
+                    addr,
+                    port: _,
+                    payload,
+                }) = read_packet(&mut tls_r).await
+                {
                     // 取出目标地址
                     let target = { *client_src.lock().await };
                     if let Some(src) = target {

@@ -1,13 +1,15 @@
-use crate::protocol::utils::{Command, read_handshake, read_packet, write_packet};
+use crate::protocol::utils::{Command, NATType, read_handshake, read_packet, write_packet};
 use crate::tls;
 use anyhow::Result;
 use bytes::Bytes;
+use dashmap::DashMap;
 use socket2::{Domain, SockRef, Socket, TcpKeepalive, Type};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
+use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
 
 pub async fn run(port: u16) -> Result<()> {
@@ -90,29 +92,83 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
         }
 
         // === UDP 模式 (Full Cone) ===
-        Command::UdpAssociate => {
+        Command::UdpAssociate { nat_type } => {
+            let whitelist = Arc::new(Mutex::new(DashMap::<(String, u16), Instant>::new()));
+
             let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
 
             // 外部 -> 代理 -> 客户端
             let tx_clone = tx.clone();
             let sock_recv = socket.clone();
+
+            let whitelist_recv = whitelist.clone();
+            let clean_map = whitelist.clone();
+
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(60));
+                // RFC 4787 NATs维护UDP映射超时时间应不少于2分钟
+                let ttl = Duration::from_secs(120);
+
+                loop {
+                    interval.tick().await;
+                    let now = Instant::now();
+                    let guard = clean_map.lock().await;
+                    guard.retain(|_, &mut v| now.duration_since(v) < ttl);
+                }
+            });
+
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65535];
-                while let Ok((n, addr)) = sock_recv.recv_from(&mut buf).await {
-                    let cmd = Command::UdpData {
-                        addr: addr.to_string(),
-                        payload: Bytes::copy_from_slice(&buf[..n]),
+                loop {
+                    let (n, src_addr) = match sock_recv.recv_from(&mut buf).await {
+                        Ok(res) => res,
+                        Err(e) => {
+                            eprintln!("Receive data from socket Error: {}", e);
+                            break;
+                        }
                     };
-                    let _ = tx_clone.send(cmd).await;
+                    let allow = match nat_type {
+                        NATType::FullCone => true,
+                        NATType::Restricted => {
+                            let list = whitelist_recv.lock().await;
+                            list.iter().any(|item| item.key().0 == src_addr.to_string())
+                        }
+                        NATType::PortRestricted => {
+                            let list = whitelist_recv.lock().await;
+                            list.iter().any(|item| {
+                                item.key().0 == src_addr.ip().to_string()
+                                    && item.key().1 == src_addr.port()
+                            })
+                        }
+                    };
+
+                    if allow {
+                        let cmd = Command::UdpData {
+                            addr: src_addr.to_string(),
+                            port: src_addr.port(),
+                            payload: Bytes::copy_from_slice(&buf[..n]),
+                        };
+                        if tx_clone.send(cmd).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             });
 
             // 客户端 -> 代理 -> 外部
             let sock_send = socket.clone();
             tokio::spawn(async move {
-                while let Ok(Command::UdpData { addr, payload }) =
-                    read_packet(&mut client_reader).await
+                while let Ok(Command::UdpData {
+                    addr,
+                    port,
+                    payload,
+                }) = read_packet(&mut client_reader).await
                 {
+                    if nat_type != NATType::FullCone {
+                        let guard = whitelist.lock().await;
+                        guard.insert((addr.clone(), port), Instant::now());
+                    }
+
                     if sock_send.send_to(&payload, &addr).await.is_err() {
                         break;
                     };
