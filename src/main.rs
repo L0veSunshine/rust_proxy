@@ -33,10 +33,6 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.mode {
         Mode::Server { port } => server::run(port).await,
-        Mode::Client {
-            local,
-            remote,
-            nat,
-        } => client::run(&local, &remote, nat).await,
+        Mode::Client { local, remote, nat } => client::run(&local, &remote, nat).await,
     }
 }
