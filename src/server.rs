@@ -131,7 +131,8 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                         NATType::FullCone => true,
                         NATType::Restricted => {
                             let list = whitelist_recv.lock().await;
-                            list.iter().any(|item| item.key().0 == src_addr.to_string())
+                            list.iter()
+                                .any(|item| item.key().0 == src_addr.ip().to_string())
                         }
                         NATType::PortRestricted => {
                             let list = whitelist_recv.lock().await;
@@ -144,7 +145,7 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
 
                     if allow {
                         let cmd = Command::UdpData {
-                            addr: src_addr.to_string(),
+                            addr: src_addr.ip().to_string(),
                             port: src_addr.port(),
                             payload: Bytes::copy_from_slice(&buf[..n]),
                         };
