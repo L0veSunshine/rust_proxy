@@ -141,14 +141,15 @@ async fn handle_conn(
             tokio::spawn(async move {
                 while let Ok(Command::UdpData {
                     addr,
-                    port: _,
+                    port,
                     payload,
                 }) = read_packet(&mut tls_r).await
                 {
                     // 取出目标地址
                     let target = { *client_src.lock().await };
                     if let Some(src) = target {
-                        match socks5::build_udp_packet(&addr, &payload) {
+                        let full_addr = format!("{}:{}", addr, port);
+                        match socks5::build_udp_packet(&full_addr, &payload) {
                             Ok(packet) => {
                                 if udp_send.send_to(&packet, src).await.is_err() {
                                     break;

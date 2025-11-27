@@ -169,7 +169,11 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                         guard.insert((addr.clone(), port), Instant::now());
                     }
 
-                    if sock_send.send_to(&payload, &addr).await.is_err() {
+                    if sock_send
+                        .send_to(&payload, (addr.as_str(), port))
+                        .await
+                        .is_err()
+                    {
                         break;
                     };
                 }
