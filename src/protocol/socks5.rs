@@ -85,7 +85,7 @@ pub async fn send_reply(stream: &mut TcpStream, addr: SocketAddr) -> Result<()> 
     Ok(())
 }
 
-pub fn parse_udp_packet(data: &[u8]) -> Result<(String, Vec<u8>)> {
+pub fn parse_udp_packet(data: &[u8]) -> Result<(String, u16, Vec<u8>)> {
     if data.len() < 4 {
         bail!("Invalid UDP packet");
     }
@@ -138,7 +138,7 @@ pub fn parse_udp_packet(data: &[u8]) -> Result<(String, Vec<u8>)> {
     let port = u16::from_be_bytes([data[cursor], data[cursor + 1]]);
     cursor += 2;
     let payload = data[cursor..].to_vec();
-    Ok((format!("{}:{}", addr_str, port), payload))
+    Ok((addr_str, port, payload))
 }
 
 /// 构建 SOCKS5 UDP 数据包 (用于回复客户端)

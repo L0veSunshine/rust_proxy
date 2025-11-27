@@ -1,6 +1,8 @@
 use anyhow::{Result, bail};
 use bytes::Bytes;
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
@@ -9,13 +11,35 @@ pub const UUID: &str = "8edc51f2-1bf8-42a8-9229-b9014738f617";
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Command {
     // TCP 请求连接
-    Connect { addr: String },
+    Connect {
+        addr: String,
+    },
     // UDP 开启会话 (Full Cone)
-    UdpAssociate,
+    UdpAssociate {
+        nat_type: NATType,
+    },
     // TCP 数据
-    Data { payload: Bytes },
+    Data {
+        payload: Bytes,
+    },
     // UDP 数据 (需要带目标地址)
-    UdpData { addr: String, payload: Bytes },
+    UdpData {
+        addr: String,
+        port: u16,
+        payload: Bytes,
+    },
+}
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, ValueEnum)]
+pub enum NATType {
+    FullCone = 1,
+    Restricted = 2,
+    PortRestricted = 3,
+}
+
+impl Display for NATType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
 }
 
 pub async fn write_handshake<S>(stream: &mut S, cmd: &Command) -> Result<()>
