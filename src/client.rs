@@ -100,7 +100,9 @@ async fn handle_conn(
 
             // 3. 规范化处理：将 IPv4 映射的 IPv6 地址 (如 ::ffff:127.0.0.1) 转回纯 IPv4
             // 这样能兼容那些看不懂 IPv6 格式但实际在使用 IPv4 的老旧客户端
-            if let IpAddr::V6(v6) = reply_ip && let Some(v4) = v6.to_ipv4() {
+            if let IpAddr::V6(v6) = reply_ip
+                && let Some(v4) = v6.to_ipv4()
+            {
                 reply_ip = IpAddr::V4(v4);
             }
 
