@@ -131,6 +131,7 @@ where
 }
 
 /// 创建一个绑定到双栈 (IPv4 + IPv6) 随机端口的 UDP Socket
+#[allow(dead_code)]
 pub fn bind_dual_stack_udp() -> Result<tokio::net::UdpSocket> {
     // 1. 创建 IPv6 UDP Socket
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
