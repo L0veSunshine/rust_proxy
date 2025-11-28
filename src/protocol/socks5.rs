@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow, bail};
+use std::net::IpAddr::{V4, V6};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -74,18 +75,23 @@ where
 }
 
 pub async fn send_reply(stream: &mut TcpStream, addr: SocketAddr) -> Result<()> {
-    let ip = match addr.ip() {
-        std::net::IpAddr::V4(ip) => ip.octets(),
-        _ => [0, 0, 0, 0],
-    };
     let mut reply = vec![0x05, 0x00, 0x00, 0x01];
-    reply.extend_from_slice(&ip);
+    match addr.ip() {
+        V4(ip) => {
+            reply.push(0x01);
+            reply.extend_from_slice(&ip.octets())
+        }
+        V6(ip) => {
+            reply.push(0x04);
+            reply.extend_from_slice(&ip.octets())
+        }
+    };
     reply.extend_from_slice(&addr.port().to_be_bytes());
     stream.write_all(&reply).await?;
     Ok(())
 }
 
-pub fn parse_udp_packet(data: &[u8]) -> Result<(String, u16, Vec<u8>)> {
+pub fn parse_udp_packet(data: &[u8]) -> Result<(String, u16, usize)> {
     if data.len() < 4 {
         bail!("Invalid UDP packet");
     }
@@ -137,8 +143,7 @@ pub fn parse_udp_packet(data: &[u8]) -> Result<(String, u16, Vec<u8>)> {
     }
     let port = u16::from_be_bytes([data[cursor], data[cursor + 1]]);
     cursor += 2;
-    let payload = data[cursor..].to_vec();
-    Ok((addr_str, port, payload))
+    Ok((addr_str, port, cursor))
 }
 
 /// 构建 SOCKS5 UDP 数据包 (用于回复客户端)
@@ -155,11 +160,11 @@ pub fn build_udp_packet(target_addr: &str, data: &[u8]) -> Result<Vec<u8>> {
     // 尝试解析为标准 SocketAddr (IP:Port)
     if let Ok(addr) = target_addr.parse::<SocketAddr>() {
         match addr.ip() {
-            std::net::IpAddr::V4(ip) => {
+            V4(ip) => {
                 buf.push(ATYP_IPV4);
                 buf.extend_from_slice(&ip.octets());
             }
-            std::net::IpAddr::V6(ip) => {
+            V6(ip) => {
                 buf.push(ATYP_IPV6);
                 buf.extend_from_slice(&ip.octets());
             }
