@@ -1,13 +1,16 @@
-use crate::protocol::utils::{Command, NATType, read_handshake, read_packet, write_packet};
+use crate::protocol::utils::{
+    Command, NATType, bind_dual_stack_udp, read_handshake, read_packet, write_packet,
+};
 use crate::tls;
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
 use moka::future::Cache;
 use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
 use tokio::sync::{Notify, mpsc};
 use tokio_rustls::TlsAcceptor;
@@ -105,7 +108,7 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                 .time_to_idle(Duration::from_secs(120))
                 .build();
 
-            let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+            let socket = Arc::new(bind_dual_stack_udp()?);
 
             // 外部 -> 代理 -> 客户端
             let tx_clone = tx.clone();
@@ -133,14 +136,26 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                             }
                         }
                     };
+
+                    let canonical_ip = match src_addr.ip() {
+                        IpAddr::V6(v6) => {
+                            if let Some(v4) = v6.to_ipv4() {
+                                IpAddr::V4(v4)
+                            } else {
+                                IpAddr::V6(v6)
+                            }
+                        }
+                        v4 => v4,
+                    };
+
                     let allow = match nat_type {
                         NATType::FullCone => true,
                         NATType::Restricted => {
-                            let key = src_addr.ip().to_string();
+                            let key = canonical_ip.to_string();
                             whitelist_recv.contains_key(&key) // O(1) 查询
                         }
                         NATType::PortRestricted => {
-                            let key = format!("{}:{}", src_addr.ip(), src_addr.port());
+                            let key = format!("{}:{}", canonical_ip, src_addr.port());
                             whitelist_recv.contains_key(&key) // O(1) 查询
                         }
                     };
@@ -149,7 +164,7 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                         let packet = buf.split_to(n);
 
                         let cmd = Command::UdpData {
-                            addr: src_addr.ip().to_string(),
+                            addr: canonical_ip.to_string(),
                             port: src_addr.port(),
                             payload: packet.freeze(),
                         };

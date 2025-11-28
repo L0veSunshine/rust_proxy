@@ -1,16 +1,18 @@
 use crate::protocol::socks5;
-use crate::protocol::utils::{Command, NATType, read_packet, write_handshake, write_packet};
+use crate::protocol::utils::{
+    Command, NATType, bind_dual_stack_udp, read_packet, write_handshake, write_packet,
+};
 use crate::tls;
 use anyhow::Result;
 use bytes::Bytes;
 use rustls::pki_types::ServerName;
 use socket2::{SockRef, TcpKeepalive};
 use std::convert::TryFrom;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 
 pub async fn run(listen: &str, server: &str, nattype: NATType) -> Result<()> {
@@ -86,10 +88,27 @@ async fn handle_conn(
             // 发送 UDP Associate 握手
             write_handshake(&mut tls_w, &Command::UdpAssociate { nat_type: nattype }).await?;
 
-            // 绑定本地 UDP
-            let udp = UdpSocket::bind("127.0.0.1:0").await?;
-            let local_udp_addr = udp.local_addr()?;
-            socks5::send_reply(&mut local, local_udp_addr).await?;
+            // 1. 绑定双栈 Socket (实际上绑定了 [::]:0，同时覆盖 IPv4/IPv6)
+            let udp = bind_dual_stack_udp()?;
+            let local_port = udp.local_addr()?.port();
+
+            // 2. 关键修改：动态获取当前 TCP 连接的本地目标 IP
+            // 如果客户端连的是 127.0.0.1，这里就是 127.0.0.1
+            // 如果客户端连的是 ::1，这里就是 ::1
+            let local_tcp_addr = local.local_addr()?;
+            let mut reply_ip = local_tcp_addr.ip();
+
+            // 3. 规范化处理：将 IPv4 映射的 IPv6 地址 (如 ::ffff:127.0.0.1) 转回纯 IPv4
+            // 这样能兼容那些看不懂 IPv6 格式但实际在使用 IPv4 的老旧客户端
+            if let IpAddr::V6(v6) = reply_ip {
+                if let Some(v4) = v6.to_ipv4() {
+                    reply_ip = IpAddr::V4(v4);
+                }
+            }
+
+            // 4. 发送回复
+            let reply_addr = SocketAddr::new(reply_ip, local_port);
+            socks5::send_reply(&mut local, reply_addr).await?;
 
             let udp = Arc::new(udp);
 
