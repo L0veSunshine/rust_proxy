@@ -1,4 +1,6 @@
-use crate::protocol::utils::{Command, NATType, read_handshake, read_packet, write_packet, bind_dual_stack_udp};
+use crate::protocol::utils::{
+    Command, NATType, bind_dual_stack_udp, read_handshake, read_packet, write_packet,
+};
 use crate::tls;
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};

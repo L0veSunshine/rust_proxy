@@ -2,9 +2,9 @@ use anyhow::{Result, bail};
 use bytes::Bytes;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::fmt::Display;
 use std::net::{Ipv6Addr, SocketAddr};
-use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
