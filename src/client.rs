@@ -129,7 +129,7 @@ async fn handle_conn(
                         let cmd = Command::UdpData {
                             addr: target,
                             port,
-                            payload: Bytes::copy_from_slice(&buf[cursor..]),
+                            payload: Bytes::copy_from_slice(&buf[n + cursor..]),
                         };
                         if net_tx.send(cmd).await.is_err() {
                             break;
