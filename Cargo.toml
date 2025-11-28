@@ -16,4 +16,4 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["logg
 rustls-pemfile = "2.2.0"
 uuid = { version = "1.18.1", features = ["v4"] }
 socket2 = "0.6.1"
-dashmap = { version = "6.1.0" }
+moka = { version = "0.12.11", features = ["future"] }
