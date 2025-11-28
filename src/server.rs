@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::select;
+use tokio::sync::{Notify, mpsc};
 use tokio_rustls::TlsAcceptor;
 
 pub const UDP_BUFFER_SIZE: usize = 65535;
@@ -95,8 +96,13 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
 
         // === UDP 模式 (Full Cone) ===
         Command::UdpAssociate { nat_type } => {
+            // 创建停机信号
+            let shutdown = Arc::new(Notify::new());
+            let shutdown_rx = shutdown.clone();
+            let shutdown_tx = shutdown.clone();
+
             // RFC 4787 NATs维护UDP映射超时时间应不少于2分钟
-            let whitelist: Cache<(String, u16), ()> = Cache::builder()
+            let whitelist: Cache<String, ()> = Cache::builder()
                 .max_capacity(10000)
                 .time_to_idle(Duration::from_secs(120))
                 .build();
@@ -117,21 +123,28 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                     }
                     buf.resize(UDP_BUFFER_SIZE, 0);
 
-                    let (n, src_addr) = match sock_recv.recv_from(&mut buf).await {
-                        Ok(res) => res,
-                        Err(e) => {
-                            eprintln!("Receive data from socket Error: {}", e);
-                            break;
+                    let (n, src_addr) = select! {
+                        _ = shutdown_rx.notified() => break,
+                        res = sock_recv.recv_from(&mut buf) => {
+                            match res {
+                                Ok(res) => res,
+                                Err(e) => {
+                                    eprintln!("Receive data from socket Error: {}", e);
+                                    break;
+                                }
+                            }
                         }
                     };
                     let allow = match nat_type {
                         NATType::FullCone => true,
-                        NATType::Restricted => whitelist_recv
-                            .iter()
-                            .any(|(item, _)| item.0 == src_addr.ip().to_string()),
-                        NATType::PortRestricted => whitelist_recv.iter().any(|(item, _)| {
-                            item.0 == src_addr.ip().to_string() && item.1 == src_addr.port()
-                        }),
+                        NATType::Restricted => {
+                            let key = src_addr.ip().to_string();
+                            whitelist_recv.contains_key(&key) // O(1) 查询
+                        }
+                        NATType::PortRestricted => {
+                            let key = format!("{}:{}", src_addr.ip(), src_addr.port());
+                            whitelist_recv.contains_key(&key) // O(1) 查询
+                        }
                     };
 
                     if allow {
@@ -158,8 +171,10 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                     payload,
                 }) = read_packet(&mut client_reader).await
                 {
-                    if nat_type != NATType::FullCone {
-                        whitelist.insert((addr.clone(), port), ()).await;
+                    if nat_type == NATType::Restricted {
+                        whitelist.insert(addr.clone(), ()).await;
+                    } else if nat_type == NATType::PortRestricted {
+                        whitelist.insert(format!("{}:{}", addr, port), ()).await;
                     }
 
                     if sock_send
@@ -170,6 +185,7 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                         break;
                     };
                 }
+                shutdown_tx.notify_one();
             });
         }
         _ => return Ok(()),
