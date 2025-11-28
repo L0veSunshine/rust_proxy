@@ -1,7 +1,5 @@
 use crate::protocol::socks5;
-use crate::protocol::utils::{
-    Command, NATType, bind_dual_stack_udp, read_packet, write_handshake, write_packet,
-};
+use crate::protocol::utils::{Command, NATType, read_packet, write_handshake, write_packet};
 use crate::tls;
 use anyhow::Result;
 use bytes::Bytes;
@@ -12,7 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
 
 pub async fn run(listen: &str, server: &str, nattype: NATType) -> Result<()> {
@@ -89,7 +87,7 @@ async fn handle_conn(
             write_handshake(&mut tls_w, &Command::UdpAssociate { nat_type: nattype }).await?;
 
             // 绑定本地 UDP
-            let udp = bind_dual_stack_udp()?;
+            let udp = UdpSocket::bind("127.0.0.1:0").await?;
             let local_udp_addr = udp.local_addr()?;
             socks5::send_reply(&mut local, local_udp_addr).await?;
 
@@ -129,7 +127,7 @@ async fn handle_conn(
                         let cmd = Command::UdpData {
                             addr: target,
                             port,
-                            payload: Bytes::copy_from_slice(&buf[cursor..]),
+                            payload: Bytes::copy_from_slice(&buf[cursor..n]),
                         };
                         if net_tx.send(cmd).await.is_err() {
                             break;

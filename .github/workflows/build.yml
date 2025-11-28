@@ -64,7 +64,7 @@ jobs:
           echo "ARTIFACT_NAME=rust_proxy_${OS_NAME}_${ARCH_SUFFIX}" >> $GITHUB_ENV
 
       - name: Upload Binary
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || contains(github.event.pull_request.title, '[artifact]')
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}

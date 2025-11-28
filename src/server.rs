@@ -1,6 +1,4 @@
-use crate::protocol::utils::{
-    Command, NATType, bind_dual_stack_udp, read_handshake, read_packet, write_packet,
-};
+use crate::protocol::utils::{Command, NATType, read_handshake, read_packet, write_packet};
 use crate::tls;
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
@@ -9,7 +7,7 @@ use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::select;
 use tokio::sync::{Notify, mpsc};
 use tokio_rustls::TlsAcceptor;
@@ -107,7 +105,7 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                 .time_to_idle(Duration::from_secs(120))
                 .build();
 
-            let socket = Arc::new(bind_dual_stack_udp()?);
+            let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
 
             // 外部 -> 代理 -> 客户端
             let tx_clone = tx.clone();
