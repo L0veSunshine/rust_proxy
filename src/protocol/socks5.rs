@@ -75,7 +75,7 @@ where
 }
 
 pub async fn send_reply(stream: &mut TcpStream, addr: SocketAddr) -> Result<()> {
-    let mut reply = vec![0x05, 0x00, 0x00, 0x01];
+    let mut reply = vec![0x05, 0x00, 0x00];
     match addr.ip() {
         V4(ip) => {
             reply.push(0x01);
