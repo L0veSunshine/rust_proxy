@@ -11,9 +11,42 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # --- 第一步：代码质量检查 ---
+  quality_check:
+    name: Code Quality Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-check-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-check-
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint with Clippy
+        run: cargo clippy --no-deps -- -D warnings
+
+  # --- 第二步：构建二进制 (只有上面的 Job 成功才会运行) ---
   build_binary:
     name: Build Binary
-    runs-on: ${{matrix.os}}
+    needs: quality_check
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -27,28 +60,17 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ matrix.rust }}
-          components: rustfmt, clippy
 
       - name: Cache Cargo dependencies
-        uses: actions/cache@v4 # 使用官方的 cache Action
+        uses: actions/cache@v4
         with:
-          path: | # 指定需要缓存的路径
+          path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target # 缓存 target 目录可以更快地跳过重复编译，但可能会导致问题，慎用。通常只缓存前两个。
-          key: ${{ runner.os }}-cargo-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }} # 缓存的键
-          restore-keys: | # 恢复缓存的键（用于匹配部分键）
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.rust }}-
-
-      - name: Check formatting
-        # 格式检查只需在其中一个 OS 和 Rust 版本上运行一次
-        if: matrix.os == 'ubuntu-latest' && contains(matrix.rust, 'stable')
-        run: cargo fmt --check
-
-      - name: Lint with Clippy
-        # 静态检查只需在其中一个 OS 和 Rust 版本上运行一次
-        if: matrix.os == 'ubuntu-latest' && contains(matrix.rust, 'stable')
-        run: cargo clippy --no-deps -- -D warnings
 
       - name: Build project
         run: cargo build --release --verbose
