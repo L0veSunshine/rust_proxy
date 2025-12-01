@@ -59,7 +59,7 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
     let cmd = read_handshake(&mut stream).await?;
 
     let (mut client_reader, mut client_writer) = tokio::io::split(stream);
-    let (tx, mut rx) = mpsc::channel::<Command>(1024);
+    let (tx, mut rx) = mpsc::channel::<Command>(256);
 
     match cmd {
         // === TCP 模式 ===
