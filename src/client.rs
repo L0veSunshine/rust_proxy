@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, mpsc};
+use tokio::select;
+use tokio::sync::{Mutex, Notify, mpsc};
 
 pub async fn run(listen: &str, server: &str, nat_type: NATType) -> Result<()> {
     let connector = Arc::new(tls::create_client_config()?);
@@ -60,11 +61,20 @@ async fn handle_conn(
 
             let (mut local_r, mut local_w) = local.into_split();
 
+            let shutdown = Arc::new(Notify::new());
+            let shutdown_tx_local = shutdown.clone();
+            let shutdown_rx_local = shutdown.clone();
+            let shutdown_tx_remote = shutdown.clone();
+            let shutdown_rx_remote = shutdown.clone();
+
             // 本地 -> 代理
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 16384];
                 loop {
-                    let n = local_r.read(&mut buf).await.unwrap_or(0);
+                    let n = select! {
+                        _ = shutdown_rx_local.notified() => 0,
+                        res = local_r.read(&mut buf) => res.unwrap_or(0),
+                    };
                     if n == 0 {
                         break;
                     }
@@ -76,14 +86,25 @@ async fn handle_conn(
                         break;
                     }
                 }
+                shutdown_tx_local.notify_one()
             });
-
             // 代理 -> 本地
-            while let Ok(Command::Data { payload }) = read_packet(&mut tls_r).await {
-                if local_w.write_all(&payload).await.is_err() {
-                    break;
-                };
+            loop {
+                select! {
+                    _ = shutdown_rx_remote.notified() => break,
+                    res = read_packet(&mut tls_r) => {
+                        if let Ok(Command::Data { payload }) = res {
+                            if local_w.write_all(&payload).await.is_err() {
+                                break;
+                            }
+                        } else {
+                            // TLS 断开或协议错误
+                            break;
+                        }
+                    }
+                }
             }
+            shutdown_tx_remote.notify_one();
         }
         socks5::SocksRequest::Udp => {
             // 发送 UDP Associate 握手
@@ -108,12 +129,29 @@ async fn handle_conn(
             // 通道：UDP Recv Loop -> TLS Writer Loop
             let (net_tx, mut net_rx) = mpsc::channel::<Command>(256);
 
+            let shutdown = Arc::new(Notify::new());
+            let shutdown_tls_writer = shutdown.clone();
+            let shutdown_udp_listener = shutdown.clone();
+            let shutdown_main = shutdown.clone();
+
             // --- 任务 A: 将 Channel 中的 UDP 请求写入 TLS ---
             tokio::spawn(async move {
-                while let Some(cmd) = net_rx.recv().await {
-                    if write_packet(&mut tls_w, &cmd).await.is_err() {
-                        break;
-                    };
+                loop {
+                    select! {
+                        _ = shutdown_tls_writer.notified() => break,
+                        msg = net_rx.recv() => {
+                            match msg {
+                                Some(cmd) => {
+                                    if write_packet(&mut tls_w, &cmd).await.is_err() {
+                                        // TLS 写失败，通知全员退出
+                                        shutdown_tls_writer.notify_one();
+                                        break;
+                                    };
+                                }
+                                None => break, // Channel 关闭
+                            }
+                        }
+                    }
                 }
             });
 
@@ -123,54 +161,68 @@ async fn handle_conn(
             // --- 任务 B: 接收本地 UDP 数据 -> 转发给 Channel ---
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65535];
-                while let Ok((n, src)) = udp_recv.recv_from(&mut buf).await {
-                    {
-                        let mut guard = client_src_recorder.lock().await;
-                        if guard.as_ref() != Some(&src) {
-                            *guard = Some(src);
+                loop {
+                    select! {
+                        _ = shutdown_udp_listener.notified() => break,
+                        res = udp_recv.recv_from(&mut buf) => {
+                            if let Ok((n, src)) = res {
+                                {
+                                    let mut guard = client_src_recorder.lock().await;
+                                    if guard.as_ref() != Some(&src) {
+                                        *guard = Some(src);
+                                    }
+                                }
+
+                                if let Ok((target, port, cursor)) = socks5::parse_udp_packet(&buf[..n]) {
+                                    let cmd = Command::UdpData {
+                                        addr: target,
+                                        port,
+                                        payload: Bytes::copy_from_slice(&buf[cursor..n]),
+                                    };
+                                    // 如果发送失败（接收端挂了），退出
+                                    if net_tx.send(cmd).await.is_err() {
+                                        break;
+                                    }
+                                };
+                            } else {
+                                break; // UDP 读取错误
+                            }
                         }
                     }
-
-                    if let Ok((target, port, cursor)) = socks5::parse_udp_packet(&buf[..n]) {
-                        let cmd = Command::UdpData {
-                            addr: target,
-                            port,
-                            payload: Bytes::copy_from_slice(&buf[cursor..n]),
-                        };
-                        if net_tx.send(cmd).await.is_err() {
-                            break;
-                        }
-                    };
                 }
             });
 
             // --- 任务 C (主线程): 接收 TLS 数据 -> 转发回本地 UDP ---
             let udp_send = udp.clone();
-            tokio::spawn(async move {
-                while let Ok(Command::UdpData {
-                    addr,
-                    port,
-                    payload,
-                }) = read_packet(&mut tls_r).await
-                {
-                    // 取出目标地址
-                    let target = { *client_src.lock().await };
-                    if let Some(src) = target {
-                        match socks5::build_udp_packet(&addr, port, &payload) {
-                            Ok(packet) => {
-                                if udp_send.send_to(&packet, src).await.is_err() {
-                                    break;
+            loop {
+                select! {
+                    _ = shutdown_main.notified() => break,
+                    res = read_packet(&mut tls_r) => {
+                        match res {
+                            Ok(Command::UdpData { addr, port, payload }) => {
+                                let target = { *client_src.lock().await };
+                                if let Some(src) = target {
+                                    match socks5::build_udp_packet(&addr, port, &payload) {
+                                        Ok(packet) => {
+                                            if udp_send.send_to(&packet, src).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Failed to build UDP packet: {}", e);
+                                        }
+                                    }
                                 }
                             }
-                            Err(e) => {
-                                eprintln!("Failed to build UDP packet: {}", e);
+                            _ => {
+                                // 错误或连接关闭，通知其他任务退出
+                                shutdown_main.notify_one();
+                                break;
                             }
                         }
-                    } else {
-                        eprintln!("Dropping packet, no client known yet");
                     }
                 }
-            });
+            }
         }
     }
     Ok(())

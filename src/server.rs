@@ -78,7 +78,7 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                 let mut buf = vec![0u8; 16384];
                 loop {
                     select! {
-                        _ = shutdown_tcp_tx.notified() => break,
+                        _ = shutdown_tcp_rx.notified() => break,
                         n = target_r.read(&mut buf) => {
                             match n {
                                 Ok(0) => break,
@@ -107,7 +107,7 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                         break;
                     };
                 }
-                shutdown_tcp_rx.notify_one()
+                shutdown_tcp_tx.notify_one()
             });
         }
 
