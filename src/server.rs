@@ -6,6 +6,7 @@ use anyhow::Result;
 use bytes::{Bytes, BytesMut};
 use moka::future::Cache;
 use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -58,7 +59,7 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
     let cmd = read_handshake(&mut stream).await?;
 
     let (mut client_reader, mut client_writer) = tokio::io::split(stream);
-    let (tx, mut rx) = mpsc::channel::<Command>(1024);
+    let (tx, mut rx) = mpsc::channel::<Command>(256);
 
     match cmd {
         // === TCP 模式 ===
@@ -135,14 +136,26 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                             }
                         }
                     };
+
+                    let canonical_ip = match src_addr.ip() {
+                        IpAddr::V6(v6) => {
+                            if let Some(v4) = v6.to_ipv4() {
+                                IpAddr::V4(v4)
+                            } else {
+                                IpAddr::V6(v6)
+                            }
+                        }
+                        v4 => v4,
+                    };
+
                     let allow = match nat_type {
                         NATType::FullCone => true,
                         NATType::Restricted => {
-                            let key = src_addr.ip().to_string();
+                            let key = canonical_ip.to_string();
                             whitelist_recv.contains_key(&key) // O(1) 查询
                         }
                         NATType::PortRestricted => {
-                            let key = format!("{}:{}", src_addr.ip(), src_addr.port());
+                            let key = format!("{}:{}", canonical_ip, src_addr.port());
                             whitelist_recv.contains_key(&key) // O(1) 查询
                         }
                     };
@@ -151,7 +164,7 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                         let packet = buf.split_to(n);
 
                         let cmd = Command::UdpData {
-                            addr: src_addr.ip().to_string(),
+                            addr: canonical_ip.to_string(),
                             port: src_addr.port(),
                             payload: packet.freeze(),
                         };

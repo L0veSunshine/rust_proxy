@@ -8,14 +8,14 @@ use bytes::Bytes;
 use rustls::pki_types::ServerName;
 use socket2::{SockRef, TcpKeepalive};
 use std::convert::TryFrom;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 
-pub async fn run(listen: &str, server: &str, nattype: NATType) -> Result<()> {
+pub async fn run(listen: &str, server: &str, nat_type: NATType) -> Result<()> {
     let connector = Arc::new(tls::create_client_config()?);
     let listener = TcpListener::bind(listen).await?;
     let ka = TcpKeepalive::new().with_time(Duration::from_secs(60)); // 空闲60秒后开始探测
@@ -29,7 +29,7 @@ pub async fn run(listen: &str, server: &str, nattype: NATType) -> Result<()> {
         let server = server.to_string();
         let connector = connector.clone();
         tokio::spawn(async move {
-            let _ = handle_conn(socket, server, connector, nattype).await;
+            let _ = handle_conn(socket, server, connector, nat_type).await;
         });
     }
 }
@@ -38,7 +38,7 @@ async fn handle_conn(
     mut local: TcpStream,
     server: String,
     connector: Arc<tokio_rustls::TlsConnector>,
-    nattype: NATType,
+    nat_type: NATType,
 ) -> Result<()> {
     // SOCKS5 握手
     let req = socks5::handshake(&mut local).await?;
@@ -55,7 +55,8 @@ async fn handle_conn(
         socks5::SocksRequest::Tcp(target_addr) => {
             // 发送带 Padding 和 Auth 的握手
             write_handshake(&mut tls_w, &Command::Connect { addr: target_addr }).await?;
-            socks5::send_reply(&mut local, "0.0.0.0:0".parse().unwrap()).await?;
+            let loop_back_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
+            socks5::send_reply(&mut local, loop_back_addr).await?;
 
             let (mut local_r, mut local_w) = local.into_split();
 
@@ -86,12 +87,17 @@ async fn handle_conn(
         }
         socks5::SocksRequest::Udp => {
             // 发送 UDP Associate 握手
-            write_handshake(&mut tls_w, &Command::UdpAssociate { nat_type: nattype }).await?;
+            write_handshake(&mut tls_w, &Command::UdpAssociate { nat_type }).await?;
 
-            // 绑定本地 UDP
+            // 绑定双栈 Socket (实际上绑定了 [::]:0，同时覆盖 IPv4/IPv6)
             let udp = bind_dual_stack_udp()?;
-            let local_udp_addr = udp.local_addr()?;
-            socks5::send_reply(&mut local, local_udp_addr).await?;
+            let local_port = udp.local_addr()?.port();
+
+            // 获取当前 TCP 连接的本地目标 IP
+            let local_tcp_addr = local.local_addr()?;
+
+            let reply_addr = SocketAddr::new(local_tcp_addr.ip(), local_port);
+            socks5::send_reply(&mut local, reply_addr).await?;
 
             let udp = Arc::new(udp);
 
@@ -100,7 +106,7 @@ async fn handle_conn(
             let client_src = Arc::new(Mutex::new(None::<SocketAddr>));
 
             // 通道：UDP Recv Loop -> TLS Writer Loop
-            let (net_tx, mut net_rx) = mpsc::channel::<Command>(1024);
+            let (net_tx, mut net_rx) = mpsc::channel::<Command>(256);
 
             // --- 任务 A: 将 Channel 中的 UDP 请求写入 TLS ---
             tokio::spawn(async move {
@@ -129,7 +135,7 @@ async fn handle_conn(
                         let cmd = Command::UdpData {
                             addr: target,
                             port,
-                            payload: Bytes::copy_from_slice(&buf[cursor..]),
+                            payload: Bytes::copy_from_slice(&buf[cursor..n]),
                         };
                         if net_tx.send(cmd).await.is_err() {
                             break;
@@ -150,8 +156,7 @@ async fn handle_conn(
                     // 取出目标地址
                     let target = { *client_src.lock().await };
                     if let Some(src) = target {
-                        let full_addr = format!("{}:{}", addr, port);
-                        match socks5::build_udp_packet(&full_addr, &payload) {
+                        match socks5::build_udp_packet(&addr, port, &payload) {
                             Ok(packet) => {
                                 if udp_send.send_to(&packet, src).await.is_err() {
                                     break;
