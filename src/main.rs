@@ -23,7 +23,7 @@ enum Mode {
         local: String,
         #[arg(long, default_value = "127.0.0.1:4433")]
         remote: String,
-        #[arg(long, default_value_t = NATType::FullCone)]
+        #[arg(long, default_value = "full-cone")]
         nat: NATType,
     },
 }
