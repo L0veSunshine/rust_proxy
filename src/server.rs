@@ -67,20 +67,35 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
             let target = TcpStream::connect(&addr).await?;
             let (mut target_r, mut target_w) = target.into_split();
 
+            // 创建停机信号
+            let shutdown_tcp = Arc::new(Notify::new());
+            let shutdown_tcp_rx = shutdown_tcp.clone();
+            let shutdown_tcp_tx = shutdown_tcp.clone();
+
             // 目标 -> 代理 -> 客户端
             let tx_clone = tx.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 16384];
                 loop {
-                    let n = target_r.read(&mut buf).await.unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    let cmd = Command::Data {
-                        payload: Bytes::copy_from_slice(&buf[..n]),
-                    };
-                    if tx_clone.send(cmd).await.is_err() {
-                        break;
+                    select! {
+                        _ = shutdown_tcp_tx.notified() => break,
+                        n = target_r.read(&mut buf) => {
+                            match n {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    let cmd = Command::Data {
+                                        payload: Bytes::copy_from_slice(&buf[..n]),
+                                    };
+                                    if tx_clone.send(cmd).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("读取错误: {}", e);
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             });
@@ -92,6 +107,7 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                         break;
                     };
                 }
+                shutdown_tcp_rx.notify_one()
             });
         }
 
