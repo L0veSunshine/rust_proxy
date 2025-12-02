@@ -73,8 +73,10 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
 
             // 创建停机信号
             let shutdown_tcp = Arc::new(Notify::new());
-            let shutdown_tcp_rx = shutdown_tcp.clone();
-            let shutdown_tcp_tx = shutdown_tcp.clone();
+            let shutdown_tcp_rx_local = shutdown_tcp.clone();
+            let shutdown_tcp_rx_remote = shutdown_tcp.clone();
+            let shutdown_tcp_tx_local = shutdown_tcp.clone();
+            let shutdown_tcp_tx_remote = shutdown_tcp.clone();
 
             // 目标 -> 代理 -> 客户端
             let tx_clone = tx.clone();
@@ -82,12 +84,12 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                 let mut buf = vec![0u8; 16384];
                 loop {
                     select! {
-                        _ = shutdown_tcp_rx.notified() => break,
+                        _ = shutdown_tcp_rx_remote.notified() => break,
                         n = target_r.read(&mut buf) => {
                             match n {
                                 Ok(0) => {
                                     tcp_cancel_token.cancel();
-                                    break
+                                    break;
                                 },
                                 Ok(n) => {
                                     let cmd = Command::Data {
@@ -105,16 +107,27 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                         }
                     }
                 }
+                shutdown_tcp_tx_remote.notify_one();
             });
 
             // 客户端 -> 代理 -> 目标
             tokio::spawn(async move {
-                while let Ok(Command::Data { payload }) = read_packet(&mut client_reader).await {
-                    if target_w.write_all(&payload).await.is_err() {
-                        break;
-                    };
+                loop {
+                    select! {
+                        _ = shutdown_tcp_rx_local.notified() => break,
+                        data = read_packet(&mut client_reader) => {
+                            match data {
+                                Ok(Command::Data { payload }) => {
+                                    if target_w.write_all(&payload).await.is_err(){
+                                        break;
+                                    };
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
                 }
-                shutdown_tcp_tx.notify_one()
+                shutdown_tcp_tx_local.notify_one()
             });
         }
 
