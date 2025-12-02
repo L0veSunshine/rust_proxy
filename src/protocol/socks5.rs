@@ -14,6 +14,8 @@ const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
 
+const NO_AUTHENTICATE: u8 = 0x00;
+
 pub async fn handshake(stream: &mut TcpStream) -> Result<SocksRequest> {
     // 1. 认证协商
     let version = stream.read_u8().await?;
@@ -23,7 +25,10 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<SocksRequest> {
     let nmethods = stream.read_u8().await?;
     let mut methods = vec![0u8; nmethods as usize];
     stream.read_exact(&mut methods).await?;
-    stream.write_all(&[0x05, 0x00]).await?; // No Auth
+    if !methods.contains(&NO_AUTHENTICATE) {
+        bail!("Client don't supported No Auth method");
+    }
+    stream.write_all(&[0x05, NO_AUTHENTICATE]).await?; // No Auth
 
     // 2. 请求处理
     let mut head = [0u8; 4];

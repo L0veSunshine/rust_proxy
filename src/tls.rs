@@ -33,8 +33,34 @@ pub fn create_server_config(cert_path: &str, key_path: &str) -> Result<TlsAccept
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
-// === 客户端配置 (跳过验证) ===
+// === 客户端配置 (开启验证) ===
+pub fn create_client_config(ca_path: &str) -> Result<TlsConnector> {
+    // 1. 创建根证书存储
+    let mut root_store = rustls::RootCertStore::empty();
 
+    // 2. 读取 CA 证书文件 (比如 ca.pem)
+    // 如果你是自签名证书且没有单独的 CA，这里可以直接加载服务器的 cert.pem
+    let ca_file =
+        File::open(ca_path).map_err(|e| anyhow!("Failed to open CA file '{}': {}", ca_path, e))?;
+    let mut ca_reader = BufReader::new(ca_file);
+
+    // 3. 将证书添加到信任列表
+    // rustls-pemfile 2.0 返回的是 Result<Item> 的迭代器
+    let certs = rustls_pemfile::certs(&mut ca_reader).collect::<Result<Vec<_>, _>>()?;
+
+    for cert in certs {
+        root_store.add(cert)?;
+    }
+
+    // 4. 构建配置
+    let config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
+#[allow(dead_code)]
 #[derive(Debug)]
 struct SkipServerVerification;
 
@@ -87,13 +113,4 @@ impl ServerCertVerifier for SkipServerVerification {
             rustls::SignatureScheme::ED448,
         ]
     }
-}
-
-pub fn create_client_config() -> Result<TlsConnector> {
-    let config = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-        .with_no_client_auth();
-
-    Ok(TlsConnector::from(Arc::new(config)))
 }
