@@ -88,7 +88,6 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                         n = target_r.read(&mut buf) => {
                             match n {
                                 Ok(0) => {
-                                    tcp_cancel_token.cancel();
                                     break;
                                 },
                                 Ok(n) => {
@@ -122,7 +121,10 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                                         break;
                                     };
                                 }
-                                _ => break,
+                                _ => {
+                                    tcp_cancel_token.cancel();
+                                    break
+                                },
                             }
                         }
                     }
@@ -135,8 +137,10 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
         Command::UdpAssociate { nat_type } => {
             // 创建停机信号
             let shutdown = Arc::new(Notify::new());
-            let shutdown_rx = shutdown.clone();
-            let shutdown_tx = shutdown.clone();
+            let shutdown_rx_1 = shutdown.clone();
+            let shutdown_tx_1 = shutdown.clone();
+            let shutdown_rx_2 = shutdown.clone();
+            let shutdown_tx_2 = shutdown.clone();
 
             // RFC 4787 NATs维护UDP映射超时时间应不少于2分钟
             let whitelist: Cache<String, ()> = Cache::builder()
@@ -161,7 +165,7 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                     buf.resize(UDP_BUFFER_SIZE, 0);
 
                     let (n, src_addr) = select! {
-                        _ = shutdown_rx.notified() => break,
+                        _ = shutdown_rx_1.notified() => break,
                         res = sock_recv.recv_from(&mut buf) => {
                             match res {
                                 Ok(res) => res,
@@ -172,11 +176,6 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                             }
                         }
                     };
-
-                    if n == 0 {
-                        udp_cancel_token.cancel();
-                        break;
-                    }
 
                     let canonical_ip = match src_addr.ip() {
                         IpAddr::V6(v6) => {
@@ -214,32 +213,44 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                         }
                     }
                 }
+                shutdown_tx_1.notify_one();
             });
 
             // 客户端 -> 代理 -> 外部
             let sock_send = socket.clone();
             tokio::spawn(async move {
-                while let Ok(Command::UdpData {
-                    addr,
-                    port,
-                    payload,
-                }) = read_packet(&mut client_reader).await
-                {
-                    if nat_type == NATType::Restricted {
-                        whitelist.insert(addr.clone(), ()).await;
-                    } else if nat_type == NATType::PortRestricted {
-                        whitelist.insert(format!("{}:{}", addr, port), ()).await;
-                    }
-
-                    if sock_send
-                        .send_to(&payload, (addr.as_str(), port))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                loop {
+                    let resp = select! {
+                        _ = shutdown_rx_2.notified() => break,
+                        resp = read_packet(&mut client_reader) => resp,
                     };
+                    match resp {
+                        Ok(Command::UdpData {
+                            addr,
+                            port,
+                            payload,
+                        }) => {
+                            if nat_type == NATType::Restricted {
+                                whitelist.insert(addr.clone(), ()).await;
+                            } else if nat_type == NATType::PortRestricted {
+                                whitelist.insert(format!("{}:{}", addr, port), ()).await;
+                            }
+
+                            if sock_send
+                                .send_to(&payload, (addr.as_str(), port))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            };
+                        }
+                        _ => {
+                            udp_cancel_token.cancel();
+                            break;
+                        }
+                    }
                 }
-                shutdown_tx.notify_one();
+                shutdown_tx_2.notify_one();
             });
         }
         _ => return Ok(()),

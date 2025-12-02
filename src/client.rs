@@ -150,9 +150,9 @@ async fn handle_conn(
                             }
                         }
                     }
-                    // 写失败，通知全员退出
-                    shutdown_tls_writer.notify_one();
                 }
+                // 写失败，通知全员退出
+                shutdown_tls_writer.notify_one();
             });
 
             let udp_recv = udp.clone();
@@ -190,6 +190,7 @@ async fn handle_conn(
                         }
                     }
                 }
+                shutdown_udp_listener.notify_one();
             });
 
             // --- 任务 C (主线程): 接收 TLS 数据 -> 转发回本地 UDP ---
@@ -215,14 +216,14 @@ async fn handle_conn(
                                 }
                             }
                             _ => {
-                                // 错误或连接关闭，通知其他任务退出
-                                shutdown_main.notify_one();
                                 break;
                             }
                         }
                     }
                 }
             }
+            // 错误或连接关闭，通知其他任务退出
+            shutdown_main.notify_one();
         }
     }
     Ok(())
