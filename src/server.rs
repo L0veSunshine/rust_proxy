@@ -14,6 +14,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
 use tokio::sync::{Notify, mpsc};
 use tokio_rustls::TlsAcceptor;
+use tokio_util::sync::CancellationToken;
 
 pub const UDP_BUFFER_SIZE: usize = 65535;
 pub async fn run(port: u16) -> Result<()> {
@@ -55,7 +56,10 @@ pub async fn run(port: u16) -> Result<()> {
 async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<()> {
     let mut stream = acceptor.accept(socket).await?;
 
-    // 1. 读取握手包 (UUID Auth + Padding Skip)
+    let cancel_token = CancellationToken::new();
+    let tcp_cancel_token = cancel_token.clone();
+    let udp_cancel_token = cancel_token.clone();
+    // 读取握手包 (UUID Auth + Padding Skip)
     let cmd = read_handshake(&mut stream).await?;
 
     let (mut client_reader, mut client_writer) = tokio::io::split(stream);
@@ -81,7 +85,10 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                         _ = shutdown_tcp_rx.notified() => break,
                         n = target_r.read(&mut buf) => {
                             match n {
-                                Ok(0) => break,
+                                Ok(0) => {
+                                    tcp_cancel_token.cancel();
+                                    break
+                                },
                                 Ok(n) => {
                                     let cmd = Command::Data {
                                         payload: Bytes::copy_from_slice(&buf[..n]),
@@ -153,6 +160,11 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                         }
                     };
 
+                    if n == 0 {
+                        udp_cancel_token.cancel();
+                        break;
+                    }
+
                     let canonical_ip = match src_addr.ip() {
                         IpAddr::V6(v6) => {
                             if let Some(v4) = v6.to_ipv4() {
@@ -221,8 +233,18 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
     }
 
     // 主循环：负责把 channel 里的数据写回给 TLS 客户端
-    while let Some(cmd) = rx.recv().await {
-        write_packet(&mut client_writer, &cmd).await?;
+    loop {
+        select! {
+            _ = cancel_token.cancelled() => {
+                break;
+            }
+            data = rx.recv() => {
+                match data {
+                    Some(cmd) => write_packet(&mut client_writer, &cmd).await?,
+                    None => break,
+                }
+            }
+        }
     }
 
     Ok(())
