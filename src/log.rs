@@ -126,7 +126,7 @@ impl Write for SizeRotatingAppender {
         if let Some(file) = &mut self.current_file {
             file.write(buf)
         } else {
-            Err(io::Error::new(io::ErrorKind::Other, "无法打开日志文件"))
+            Err(io::Error::other("无法打开日志文件"))
         }
     }
 
