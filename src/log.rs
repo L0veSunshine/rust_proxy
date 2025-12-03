@@ -1,10 +1,10 @@
+use chrono::Local;
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write, BufReader};
+use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
-use chrono::Local;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 
 pub struct SizeRotatingAppender {
     directory: String,
@@ -35,8 +35,7 @@ impl SizeRotatingAppender {
     /// 格式：directory/prefix.YYYY-MM-DD.log
     fn get_active_file_path(&self) -> PathBuf {
         let date = Local::now().format("%Y-%m-%d").to_string();
-        Path::new(&self.directory)
-            .join(format!("{}.{}.log", self.prefix, date))
+        Path::new(&self.directory).join(format!("{}.{}.log", self.prefix, date))
     }
 
     /// 执行轮转：重命名 -> 开新文件 -> 后台压缩
@@ -72,10 +71,7 @@ impl SizeRotatingAppender {
         // 如果文件名变了（比如跨天了），或者文件还没打开
         if self.current_file.is_none() || path != self.current_file_path {
             self.current_file_path = path.clone();
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)?;
+            let file = OpenOptions::new().create(true).append(true).open(&path)?;
             self.current_file = Some(file);
         }
         Ok(())
