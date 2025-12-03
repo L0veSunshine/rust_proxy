@@ -15,6 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
 use tokio::sync::{Mutex, Notify, mpsc};
+use tracing::error;
 
 pub async fn run(listen: &str, server: &str, nat_type: NATType) -> Result<()> {
     let connector = Arc::new(tls::create_client_config("cert.pem")?);
@@ -30,7 +31,9 @@ pub async fn run(listen: &str, server: &str, nat_type: NATType) -> Result<()> {
         let server = server.to_string();
         let connector = connector.clone();
         tokio::spawn(async move {
-            let _ = handle_conn(socket, server, connector, nat_type).await;
+            if let Err(e) = handle_conn(socket, server, connector, nat_type).await {
+                error!("Client Error: {}", e);
+            };
         });
     }
 }
@@ -73,11 +76,17 @@ async fn handle_conn(
                 loop {
                     let n = select! {
                         _ = shutdown_rx_local.notified() => 0,
-                        res = local_r.read(&mut buf) => res.unwrap_or(0),
+                        res = local_r.read(&mut buf) => {
+                            match res {
+                                Ok(0) => break,
+                                Ok(n) => n,
+                                Err(e) => {
+                                    error!("Client read from local error: {}", e);
+                                    break;
+                                }
+                            }
+                        },
                     };
-                    if n == 0 {
-                        break;
-                    }
                     // 使用 Bytes 避免这里再次拷贝
                     let cmd = Command::Data {
                         payload: Bytes::copy_from_slice(&buf[..n]),
@@ -94,7 +103,8 @@ async fn handle_conn(
                     _ = shutdown_rx_remote.notified() => break,
                     res = read_packet(&mut tls_r) => {
                         if let Ok(Command::Data { payload }) = res {
-                            if local_w.write_all(&payload).await.is_err() {
+                            if let Err(e) =local_w.write_all(&payload).await {
+                                error!("Client write tcp to local error: {}", e);
                                 break;
                             }
                         } else {
@@ -142,7 +152,8 @@ async fn handle_conn(
                         msg = net_rx.recv() => {
                             match msg {
                                 Some(cmd) => {
-                                    if write_packet(&mut tls_w, &cmd).await.is_err() {
+                                    if let Err(e) =write_packet(&mut tls_w, &cmd).await {
+                                        error!("Client write udp to proxy server error: {}", e);
                                         break;
                                     };
                                 }
@@ -205,12 +216,14 @@ async fn handle_conn(
                                 if let Some(src) = target {
                                     match socks5::build_udp_packet(&addr, port, &payload) {
                                         Ok(packet) => {
-                                            if udp_send.send_to(&packet, src).await.is_err() {
+                                            if let Err(e) =udp_send.send_to(&packet, src).await{
+                                                error!("Client write udp to local error: {}", e);
                                                 break;
                                             }
                                         }
                                         Err(e) => {
-                                            eprintln!("Failed to build UDP packet: {}", e);
+                                            error!("Failed to build UDP packet: {}", e);
+                                            break;
                                         }
                                     }
                                 }

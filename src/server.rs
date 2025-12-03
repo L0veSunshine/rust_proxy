@@ -15,6 +15,7 @@ use tokio::select;
 use tokio::sync::{Notify, mpsc};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
+use tracing::error;
 
 pub const UDP_BUFFER_SIZE: usize = 65535;
 pub async fn run(port: u16) -> Result<()> {
@@ -47,7 +48,7 @@ pub async fn run(port: u16) -> Result<()> {
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_client(socket, acceptor).await {
-                eprintln!("Error: {}", e);
+                error!("Server Error: {}", e);
             }
         });
     }
@@ -99,7 +100,7 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!("读取错误: {}", e);
+                                    error!("read form target error: {}", e);
                                     break;
                                 }
                             }
@@ -117,9 +118,10 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                         data = read_packet(&mut client_reader) => {
                             match data {
                                 Ok(Command::Data { payload }) => {
-                                    if target_w.write_all(&payload).await.is_err(){
+                                    if let Err(e) = target_w.write_all(&payload).await {
+                                        error!("Write tcp to target error: {:?}",e);
                                         break;
-                                    };
+                                    }
                                 }
                                 _ => {
                                     tcp_cancel_token.cancel();
@@ -170,7 +172,7 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                             match res {
                                 Ok(res) => res,
                                 Err(e) => {
-                                    eprintln!("Receive data from socket Error: {}", e);
+                                    error!("Receive data from socket Error: {}", e);
                                     break;
                                 }
                             }
@@ -236,11 +238,9 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                                 whitelist.insert(format!("{}:{}", addr, port), ()).await;
                             }
 
-                            if sock_send
-                                .send_to(&payload, (addr.as_str(), port))
-                                .await
-                                .is_err()
+                            if let Err(e) = sock_send.send_to(&payload, (addr.as_str(), port)).await
                             {
+                                error!("Write udp to target error: {:?}", e);
                                 break;
                             };
                         }
@@ -264,7 +264,12 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
             }
             data = rx.recv() => {
                 match data {
-                    Some(cmd) => write_packet(&mut client_writer, &cmd).await?,
+                    Some(cmd) => {
+                        if let Err (e)= write_packet(&mut client_writer, &cmd).await {
+                            error!("server write to client error: {}", e);
+                            break;
+                        }
+                    },
                     None => break,
                 }
             }
