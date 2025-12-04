@@ -1,4 +1,5 @@
 use crate::protocol::net_addr::NetAddr;
+use crate::protocol::socks5::parse_udp_packet;
 use anyhow::{Result, bail};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -77,6 +78,7 @@ where
     Ok(())
 }
 
+#[allow(unused)]
 pub async fn read_server_response<R>(stream: &mut R) -> Result<(Uuid, Command, NetAddr)>
 where
     R: AsyncRead + Unpin,
@@ -98,10 +100,74 @@ where
     Ok((uuid, cmd, addr))
 }
 
+#[allow(unused)]
 pub async fn response_to_client<W>(stream: &mut W, status: &Response) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     stream.write_u8((*status).into()).await?;
     Ok(())
+}
+
+pub fn build_udp_frame(addr: &NetAddr, payload: &[u8]) -> io::Result<Vec<u8>> {
+    let addr_bytes: Vec<u8> = addr.into();
+    // 计算 Body Len
+    let body_len = addr_bytes.len() + payload.len();
+
+    // UDP 长度字段是 u16，检查溢出
+    if body_len > u16::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "UDP frame too large",
+        ));
+    };
+    // 构建最终帧
+    // 总容量 = 2 (Length) + Addr + Payload
+    let mut frame = Vec::with_capacity(2 + body_len);
+
+    // 写入长度 (Big Endian)
+    frame.extend_from_slice(&(body_len as u16).to_be_bytes());
+
+    // 写入地址
+    frame.extend_from_slice(&addr_bytes);
+
+    // 写入 Payload
+    frame.extend_from_slice(payload);
+
+    Ok(frame)
+}
+
+pub async fn read_udp_frame<R>(stream: &mut R) -> io::Result<(NetAddr, Vec<u8>)>
+where
+    R: AsyncRead + Unpin,
+{
+    // 1. 读取 Body Len (2 字节)
+    let mut len_buf = [0u8; 2];
+    stream.read_exact(&mut len_buf).await?;
+    let body_len = u16::from_be_bytes(len_buf) as usize;
+
+    if body_len == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Empty UDP body"));
+    }
+
+    // 2. 读取 Body (包含 Address + Payload)
+    let mut body = vec![0u8; body_len];
+    stream.read_exact(&mut body).await?;
+
+    // 3. 从 Body 头部解析 NetAddr
+    let (addr, consumed_len) = parse_udp_packet(&body)?;
+
+    // 4. 截取 Payload
+    // 剩下的部分就是 Payload
+    if consumed_len > body_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Parsed address exceeds body length",
+        ));
+    }
+
+    // 使用 to_vec() 将切片转换为 Vec<u8>
+    let payload = body[consumed_len..].to_vec();
+
+    Ok((addr, payload))
 }

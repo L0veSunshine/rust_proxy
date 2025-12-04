@@ -44,27 +44,6 @@ impl Display for NATType {
     }
 }
 
-pub async fn write_handshake<S>(stream: &mut S, cmd: &Command) -> Result<()>
-where
-    S: AsyncWrite + Unpin,
-{
-    // 1. 写 UUID (身份认证)
-    let uuid = Uuid::parse_str(UUID)?;
-    let uuid_bytes: &[u8; 16] = uuid.as_bytes();
-    stream.write_all(uuid_bytes).await?;
-
-    // 2. 生成随机 Padding (抗特征分析)
-    let padding_len = rand::random_range(16..128);
-    stream.write_u8(padding_len as u8).await?;
-
-    // 3. 写 Padding (全0即可)
-    let zeros = vec![0u8; padding_len as usize];
-    stream.write_all(&zeros).await?;
-
-    // 4. 写实际指令
-    write_packet(stream, cmd).await
-}
-
 /// 普通数据包发送 (Length + Bincode)
 pub async fn write_packet<S>(stream: &mut S, cmd: &Command) -> Result<()>
 where

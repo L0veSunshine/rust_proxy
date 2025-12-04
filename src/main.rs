@@ -4,7 +4,6 @@ mod protocol;
 mod server;
 mod tls;
 
-use crate::protocol::utils::NATType;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -25,8 +24,6 @@ enum Mode {
         local: String,
         #[arg(long, default_value = "127.0.0.1:4433")]
         remote: String,
-        #[arg(long, default_value = "full-cone")]
-        nat: NATType,
     },
 }
 
@@ -47,6 +44,6 @@ async fn main() -> Result<()> {
 
     match cli.mode {
         Mode::Server { port } => server::run(port).await,
-        Mode::Client { local, remote, nat } => client::run(&local, &remote, nat).await,
+        Mode::Client { local, remote } => client::run(&local, &remote).await,
     }
 }

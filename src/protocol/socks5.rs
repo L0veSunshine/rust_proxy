@@ -1,18 +1,17 @@
-use anyhow::{Result, anyhow, bail};
+use crate::protocol::net_addr::{ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, NetAddr};
+use anyhow::{Result, bail};
+use std::io::{Error, ErrorKind};
 use std::net::IpAddr::{V4, V6};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 pub enum SocksRequest {
-    Tcp(String), // 目标地址
-    Udp,         // UDP 请求
+    Tcp(NetAddr), // 目标地址
+    Udp(NetAddr), // UDP 请求
 }
 
 const SOCKS5_VERSION: u8 = 0x05;
-const ATYP_IPV4: u8 = 0x01;
-const ATYP_DOMAIN: u8 = 0x03;
-const ATYP_IPV6: u8 = 0x04;
 
 const NO_AUTHENTICATE: u8 = 0x00;
 
@@ -31,52 +30,18 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<SocksRequest> {
     stream.write_all(&[0x05, NO_AUTHENTICATE]).await?; // No Auth
 
     // 2. 请求处理
-    let mut head = [0u8; 4];
-    stream.read_exact(&mut head).await?; // VER, CMD, RSV, ATYP
+    let mut head = [0u8; 3];
+    stream.read_exact(&mut head).await?; // VER, CMD, RSV
     let cmd = head[1];
-    let atyp = head[3];
+    let addr = NetAddr::read_from(stream).await?;
 
     if cmd == 0x01 {
-        // CONNECT
-        let addr = read_addr(stream, atyp).await?;
         Ok(SocksRequest::Tcp(addr))
     } else if cmd == 0x03 {
-        // UDP ASSOCIATE
-        // 消耗掉地址部分，不重要
-        let _ = read_addr(stream, atyp).await?;
-        Ok(SocksRequest::Udp)
+        Ok(SocksRequest::Udp(addr))
     } else {
         bail!("Unsupported command: {}", cmd);
     }
-}
-
-async fn read_addr<S>(stream: &mut S, atyp: u8) -> Result<String>
-where
-    S: AsyncReadExt + Unpin,
-{
-    let host = match atyp {
-        ATYP_IPV4 => {
-            // IPv4
-            let mut buf = [0u8; 4];
-            stream.read_exact(&mut buf).await?;
-            Ipv4Addr::from(buf).to_string()
-        }
-        ATYP_DOMAIN => {
-            // Domain
-            let len = stream.read_u8().await? as usize;
-            let mut buf = vec![0u8; len];
-            stream.read_exact(&mut buf).await?;
-            String::from_utf8(buf)?
-        }
-        ATYP_IPV6 => {
-            let mut buf = [0u8; 16];
-            stream.read_exact(&mut buf).await?;
-            Ipv6Addr::from(buf).to_string()
-        }
-        _ => bail!("unsupported atyp: {}", atyp),
-    };
-    let port = stream.read_u16().await?;
-    Ok(format!("{}:{}", host, port))
 }
 
 pub async fn send_reply(stream: &mut TcpStream, addr: SocketAddr) -> Result<()> {
@@ -96,64 +61,115 @@ pub async fn send_reply(stream: &mut TcpStream, addr: SocketAddr) -> Result<()> 
     Ok(())
 }
 
-pub fn parse_udp_packet(data: &[u8]) -> Result<(String, u16, usize)> {
+pub fn parse_udp_packet(data: &[u8]) -> std::io::Result<(NetAddr, usize)> {
+    // 基础校验：RSV(2) + FRAG(1) + ATYP(1) = 4 bytes
     if data.len() < 4 {
-        bail!("Invalid UDP packet");
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Invalid UDP packet: data too short",
+        ));
     }
-    let frag = data[2];
-    if frag != 0 {
-        bail!("Invalid UDP fragment");
+
+    // SOCKS5 UDP 头部前两个字节是 RSV，通常为 0，这里略过
+    // 第三个字节是 FRAG
+    if data[2] != 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Invalid UDP fragment: fragmentation not supported",
+        ));
     }
-    let atype = data[3];
+
+    let atyp = data[3];
     let mut cursor = 4;
 
-    let addr_str = match atype {
+    let addr = match atyp {
         ATYP_IPV4 => {
-            if data.len() < cursor + 4 {
-                bail!("Invalid IPv4 packet");
+            // 校验长度: 当前cursor + IPv4(4) + Port(2)
+            if data.len() < cursor + 4 + 2 {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "Invalid IPv4 packet: data too short",
+                ));
             }
-            let ip_data: [u8; 4] = data[cursor..cursor + 4]
-                .to_vec()
+
+            let bytes: [u8; 4] = data[cursor..cursor + 4]
                 .try_into()
-                .expect("Invalid IPv4 packet");
-            let ip = Ipv4Addr::from(ip_data);
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid IPv4 addr"))?; // 长度已校验，unwrap 安全
+            let ip = Ipv4Addr::from(bytes);
             cursor += 4;
-            ip.to_string()
+
+            // 读取端口
+            let port = u16::from_be_bytes([data[cursor], data[cursor + 1]]);
+            cursor += 2;
+
+            NetAddr::V4(ip, port)
         }
         ATYP_DOMAIN => {
+            // 校验长度: 读取 len 字节
+            if data.len() <= cursor {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "Invalid Domain packet: missing length byte",
+                ));
+            }
+
             let len = data[cursor] as usize;
             cursor += 1;
-            if data.len() < cursor + len {
-                bail!("Invalid Domain len");
+
+            // 校验长度: 域名内容(len) + Port(2)
+            if data.len() < cursor + len + 2 {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "Invalid Domain packet: data too short",
+                ));
             }
-            let domain = String::from_utf8(data[cursor..cursor + len].to_vec())?;
+
+            // 转换域名
+            let domain_bytes = &data[cursor..cursor + len];
+            let domain = String::from_utf8(domain_bytes.to_vec())
+                .map_err(|_| Error::new(ErrorKind::InvalidInput, "Invalid Domain encoding"))?;
             cursor += len;
-            domain
+
+            // 读取端口
+            let port = u16::from_be_bytes([data[cursor], data[cursor + 1]]);
+            cursor += 2;
+
+            NetAddr::Domain(domain, port)
         }
         ATYP_IPV6 => {
-            let ip_data: [u8; 16] = data[cursor..cursor + 16]
-                .to_vec()
+            // 校验长度: IPv6(16) + Port(2)
+            if data.len() < cursor + 16 + 2 {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "Invalid IPv6 packet: data too short",
+                ));
+            }
+
+            let bytes: [u8; 16] = data[cursor..cursor + 16]
                 .try_into()
-                .expect("Invalid IPv6 packet");
-            let ip = Ipv6Addr::from(ip_data);
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid IPv6 addr"))?;
+            let ip = Ipv6Addr::from(bytes);
             cursor += 16;
-            ip.to_string()
+
+            let port = u16::from_be_bytes([data[cursor], data[cursor + 1]]);
+            cursor += 2;
+
+            NetAddr::V6(ip, port)
         }
         _ => {
-            bail!("Invalid atyp");
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Unsupported ATYP: {}", atyp),
+            ));
         }
     };
-    if data.len() < cursor + 2 {
-        bail!("Invalid port");
-    }
-    let port = u16::from_be_bytes([data[cursor], data[cursor + 1]]);
-    cursor += 2;
-    Ok((addr_str, port, cursor))
+
+    Ok((addr, cursor))
 }
 
 /// 构建 SOCKS5 UDP 数据包 (用于回复客户端)
 /// 格式: RSV(2) | FRAG(1) | ATYP(1) | ADDR | PORT | DATA
-pub fn build_udp_packet(target_addr: &str, port: u16, data: &[u8]) -> Result<Vec<u8>> {
+pub fn build_udp_packet(target_addr: &NetAddr, data: &[u8]) -> std::io::Result<Vec<u8>> {
     // 预估头部最大长度 (IPv6 16+1+2=19, Domain 255+1+1+2=259) + 数据长度
     let mut buf = Vec::with_capacity(300 + data.len());
 
@@ -162,39 +178,8 @@ pub fn build_udp_packet(target_addr: &str, port: u16, data: &[u8]) -> Result<Vec
     // FRAG
     buf.push(0x00);
 
-    // 尝试解析为标准 SocketAddr (IP:Port)
-    if let Ok(addr) = target_addr.parse::<IpAddr>() {
-        match addr {
-            V4(ip) => {
-                buf.push(ATYP_IPV4);
-                buf.extend_from_slice(&ip.octets());
-            }
-            V6(ip) => {
-                buf.push(ATYP_IPV6);
-                buf.extend_from_slice(&ip.octets());
-            }
-        }
-        buf.extend_from_slice(&port.to_be_bytes());
-    } else {
-        // 如果不是标准 IP 格式，尝试作为 Domain 处理
-        // 格式预期: "domain.com:port" 或 "[::1]:port" 需要找到最后一个冒号来分割 Host 和 Port
-        let (host, port_str) = target_addr
-            .rsplit_once(':')
-            .ok_or_else(|| anyhow!("Invalid address format for UDP response: {}", target_addr))?;
-
-        let port: u16 = port_str
-            .parse()
-            .map_err(|_| anyhow!("Invalid port in address: {}", target_addr))?;
-
-        if host.len() > 255 {
-            bail!("Domain name too long (max 255 bytes): {}", host);
-        }
-
-        buf.push(ATYP_DOMAIN);
-        buf.push(host.len() as u8);
-        buf.extend_from_slice(host.as_bytes());
-        buf.extend_from_slice(&port.to_be_bytes());
-    }
+    let addr_bytes: Vec<u8> = target_addr.into();
+    buf.extend_from_slice(addr_bytes.as_slice());
 
     // Append Payload
     buf.extend_from_slice(data);
