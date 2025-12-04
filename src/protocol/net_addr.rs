@@ -70,7 +70,7 @@ impl TryFrom<&Vec<u8>> for NetAddr {
     fn try_from(value: &Vec<u8>) -> Result<Self, Self::Error> {
         let data = value.as_slice();
 
-        if data.len() < 1 {
+        if data.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Data too short",
