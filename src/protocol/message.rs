@@ -1,5 +1,5 @@
 use crate::protocol::net_addr::NetAddr;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
