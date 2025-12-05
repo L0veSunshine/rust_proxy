@@ -84,9 +84,6 @@ async fn handle_conn(
                 &target_addr,
             )
             .await?;
-
-            handle_response(&mut tls_r).await?;
-
             let loop_back_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
             socks5::send_reply(&mut local, loop_back_addr).await?;
 
@@ -125,6 +122,9 @@ async fn handle_conn(
             });
             // 代理 -> 本地
             let mut remote_to_local_buf = vec![0u8; 8192];
+            // 0-RTT
+            handle_response(&mut tls_r).await?;
+
             loop {
                 let n = select! {
                     _ = shutdown_rx_remote.notified() => break,
@@ -156,8 +156,6 @@ async fn handle_conn(
                 &target_addr,
             )
             .await?;
-
-            handle_response(&mut tls_r).await?;
 
             // 绑定双栈 Socket (实际上绑定了 [::]:0，同时覆盖 IPv4/IPv6)
             let udp = bind_dual_stack_udp()?;
@@ -219,6 +217,9 @@ async fn handle_conn(
 
             // --- 任务 B (主线程): 接收 TLS 数据 -> 转发回本地 UDP ---
             let udp_send = udp.clone();
+            // 0-RTT
+            handle_response(&mut tls_r).await?;
+
             loop {
                 select! {
                     _ = shutdown_main.notified() => break,
