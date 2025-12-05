@@ -170,7 +170,7 @@ impl NetAddr {
         match self {
             NetAddr::V4(addr, ..) => format!("{}", addr),
             NetAddr::Domain(host, ..) => host.clone(),
-            NetAddr::V6(addr, ..) => format!("[{}]", addr, ),
+            NetAddr::V6(addr, ..) => format!("[{}]", addr),
         }
     }
 
