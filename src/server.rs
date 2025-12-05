@@ -1,9 +1,12 @@
-use crate::protocol::utils::{
-    Command, NATType, bind_dual_stack_udp, read_handshake, read_packet, write_packet,
+use crate::protocol::message::{
+    Command, Response, read_client_request, read_udp_frame, response_to_client,
 };
+use crate::protocol::net_addr::NetAddr;
+use crate::protocol::socks5::build_udp_packet;
+use crate::protocol::utils::{NATType, bind_dual_stack_udp};
 use crate::tls;
 use anyhow::Result;
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use moka::future::Cache;
 use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
 use std::net::IpAddr;
@@ -12,9 +15,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::Notify;
 use tokio_rustls::TlsAcceptor;
-use tokio_util::sync::CancellationToken;
+use tracing::error;
 
 pub const UDP_BUFFER_SIZE: usize = 65535;
 pub async fn run(port: u16) -> Result<()> {
@@ -46,29 +49,29 @@ pub async fn run(port: u16) -> Result<()> {
         native_socket.set_tcp_keepalive(&ka)?;
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(socket, acceptor).await {
-                eprintln!("Error: {}", e);
+            if let Err(e) = handle_client(socket, acceptor, NATType::FullCone).await {
+                error!("Server Error: {}", e);
             }
         });
     }
 }
 
-async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<()> {
-    let mut stream = acceptor.accept(socket).await?;
-
-    let cancel_token = CancellationToken::new();
-    let tcp_cancel_token = cancel_token.clone();
-    let udp_cancel_token = cancel_token.clone();
-    // 读取握手包 (UUID Auth + Padding Skip)
-    let cmd = read_handshake(&mut stream).await?;
-
+async fn handle_client(
+    socket: TcpStream,
+    acceptor: Arc<TlsAcceptor>,
+    nat_type: NATType,
+) -> Result<()> {
+    let stream = acceptor.accept(socket).await?;
     let (mut client_reader, mut client_writer) = tokio::io::split(stream);
-    let (tx, mut rx) = mpsc::channel::<Command>(256);
+
+    // 读取握手包 (UUID Auth + Padding Skip)
+    let (_, cmd, addr) = read_client_request(&mut client_reader).await?;
+    response_to_client(&mut client_writer, &Response::Success).await?;
 
     match cmd {
         // === TCP 模式 ===
-        Command::Connect { addr } => {
-            let target = TcpStream::connect(&addr).await?;
+        Command::TcpConnect => {
+            let target = TcpStream::connect((addr.addr(), addr.port())).await?;
             let (mut target_r, mut target_w) = target.into_split();
 
             // 创建停机信号
@@ -79,62 +82,57 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
             let shutdown_tcp_tx_remote = shutdown_tcp.clone();
 
             // 目标 -> 代理 -> 客户端
-            let tx_clone = tx.clone();
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 16384];
+                let mut target_to_client_buf = vec![0u8; 8192];
                 loop {
-                    select! {
+                    let n = select! {
                         _ = shutdown_tcp_rx_remote.notified() => break,
-                        n = target_r.read(&mut buf) => {
-                            match n {
-                                Ok(0) => {
-                                    break;
-                                },
-                                Ok(n) => {
-                                    let cmd = Command::Data {
-                                        payload: Bytes::copy_from_slice(&buf[..n]),
-                                    };
-                                    if tx_clone.send(cmd).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("读取错误: {}", e);
-                                    break;
-                                }
-                            }
+                        n = target_r.read(&mut target_to_client_buf) => n
+                    };
+                    let length = match n {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(e) => {
+                            error!("read form target error: {}", e);
+                            break;
                         }
+                    };
+                    if let Err(e) = client_writer
+                        .write_all(&target_to_client_buf[..length])
+                        .await
+                    {
+                        error!("Target write to client error {}", e);
+                        break;
                     }
                 }
                 shutdown_tcp_tx_remote.notify_one();
             });
 
             // 客户端 -> 代理 -> 目标
-            tokio::spawn(async move {
-                loop {
-                    select! {
-                        _ = shutdown_tcp_rx_local.notified() => break,
-                        data = read_packet(&mut client_reader) => {
-                            match data {
-                                Ok(Command::Data { payload }) => {
-                                    if target_w.write_all(&payload).await.is_err(){
-                                        break;
-                                    };
-                                }
-                                _ => {
-                                    tcp_cancel_token.cancel();
-                                    break
-                                },
-                            }
-                        }
+            let mut client_to_target_buf = vec![0u8; 8192];
+            loop {
+                let n = select! {
+                    _ = shutdown_tcp_rx_local.notified() => break,
+                    n = client_reader.read(&mut client_to_target_buf) => n
+                };
+                let length = match n {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) => {
+                        error!("Read from client error {}", e);
+                        break;
                     }
+                };
+                if let Err(e) = target_w.write_all(&client_to_target_buf[..length]).await {
+                    error!("Write to target error {}", e);
+                    break;
                 }
-                shutdown_tcp_tx_local.notify_one()
-            });
+            }
+            shutdown_tcp_tx_local.notify_one()
         }
 
         // === UDP 模式 (Full Cone) ===
-        Command::UdpAssociate { nat_type } => {
+        Command::UdpAssociate => {
             // 创建停机信号
             let shutdown = Arc::new(Notify::new());
             let shutdown_rx_1 = shutdown.clone();
@@ -151,7 +149,6 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
             let socket = Arc::new(bind_dual_stack_udp()?);
 
             // 外部 -> 代理 -> 客户端
-            let tx_clone = tx.clone();
             let sock_recv = socket.clone();
 
             let whitelist_recv = whitelist.clone();
@@ -170,7 +167,7 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                             match res {
                                 Ok(res) => res,
                                 Err(e) => {
-                                    eprintln!("Receive data from socket Error: {}", e);
+                                    error!("Receive data from socket Error: {}", e);
                                     break;
                                 }
                             }
@@ -202,15 +199,23 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
 
                     if allow {
                         let packet = buf.split_to(n);
-
-                        let cmd = Command::UdpData {
-                            addr: canonical_ip.to_string(),
-                            port: src_addr.port(),
-                            payload: packet.freeze(),
+                        let net_addr = match canonical_ip {
+                            IpAddr::V4(ip) => NetAddr::new_ipv4(ip, src_addr.port()),
+                            IpAddr::V6(ip) => NetAddr::new_ipv6(ip, src_addr.port()),
                         };
-                        if tx_clone.send(cmd).await.is_err() {
-                            break;
-                        }
+                        let cmd = build_udp_packet(&net_addr, &packet.freeze());
+                        match cmd {
+                            Ok(c) => {
+                                if let Err(e) = client_writer.write_all(&c).await {
+                                    error!("Server write udp to client error {}", e);
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                error!("build_udp_packet fail {}", e);
+                                break;
+                            }
+                        };
                     }
                 }
                 shutdown_tx_1.notify_one();
@@ -222,52 +227,29 @@ async fn handle_client(socket: TcpStream, acceptor: Arc<TlsAcceptor>) -> Result<
                 loop {
                     let resp = select! {
                         _ = shutdown_rx_2.notified() => break,
-                        resp = read_packet(&mut client_reader) => resp,
+                        resp = read_udp_frame(&mut client_reader) => resp,
                     };
                     match resp {
-                        Ok(Command::UdpData {
-                            addr,
-                            port,
-                            payload,
-                        }) => {
+                        Ok((addr, payload)) => {
                             if nat_type == NATType::Restricted {
-                                whitelist.insert(addr.clone(), ()).await;
+                                whitelist.insert(addr.addr(), ()).await;
                             } else if nat_type == NATType::PortRestricted {
-                                whitelist.insert(format!("{}:{}", addr, port), ()).await;
+                                whitelist.insert(addr.to_string(), ()).await;
                             }
 
-                            if sock_send
-                                .send_to(&payload, (addr.as_str(), port))
+                            if let Err(e) = sock_send
+                                .send_to(&payload, (addr.addr(), addr.port()))
                                 .await
-                                .is_err()
                             {
+                                error!("Write udp to target error: {:?}", e);
                                 break;
                             };
                         }
-                        _ => {
-                            udp_cancel_token.cancel();
-                            break;
-                        }
+                        Err(_) => break,
                     }
                 }
                 shutdown_tx_2.notify_one();
             });
-        }
-        _ => return Ok(()),
-    }
-
-    // 主循环：负责把 channel 里的数据写回给 TLS 客户端
-    loop {
-        select! {
-            _ = cancel_token.cancelled() => {
-                break;
-            }
-            data = rx.recv() => {
-                match data {
-                    Some(cmd) => write_packet(&mut client_writer, &cmd).await?,
-                    None => break,
-                }
-            }
         }
     }
 

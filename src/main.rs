@@ -1,8 +1,9 @@
 mod client;
+mod log;
 mod protocol;
 mod server;
 mod tls;
-use crate::protocol::utils::NATType;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -23,16 +24,26 @@ enum Mode {
         local: String,
         #[arg(long, default_value = "127.0.0.1:4433")]
         remote: String,
-        #[arg(long, default_value = "full-cone")]
-        nat: NATType,
     },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let log_name = match cli.mode {
+        Mode::Server { .. } => "server",
+        Mode::Client { .. } => "client",
+    };
+    let appender = log::SizeRotatingAppender::new(".", log_name, 5 * 1024 * 1024);
+    let (non_blocking, _guard) = tracing_appender::non_blocking(appender);
+    tracing_subscriber::fmt()
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_target(false)
+        .init();
+
     match cli.mode {
         Mode::Server { port } => server::run(port).await,
-        Mode::Client { local, remote, nat } => client::run(&local, &remote, nat).await,
+        Mode::Client { local, remote } => client::run(&local, &remote).await,
     }
 }
