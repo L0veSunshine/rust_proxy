@@ -67,7 +67,7 @@ async fn handle_client(
     let stream = acceptor.accept(socket).await?;
     let (mut client_reader, mut client_writer) = tokio::io::split(stream);
 
-    let mut peek = vec![0u8; 128];
+    let mut peek = vec![0u8; 1024];
     let n = client_reader.read(&mut peek).await?;
 
     if n == 0 {
