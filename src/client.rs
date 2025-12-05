@@ -241,7 +241,8 @@ async fn handle_conn(
                                     }
                                 }
                             }
-                            _ => {
+                            Err(e) => {
+                                error!("read udp frame error {}", e);
                                 break;
                             }
                         }

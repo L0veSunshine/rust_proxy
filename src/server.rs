@@ -1,8 +1,7 @@
 use crate::protocol::message::{
-    Command, Response, read_client_request, read_udp_frame, response_to_client,
+    Command, Response, build_udp_frame, read_client_request, read_udp_frame, response_to_client,
 };
 use crate::protocol::net_addr::NetAddr;
-use crate::protocol::socks5::build_udp_packet;
 use crate::protocol::utils::{NATType, bind_dual_stack_udp};
 use crate::tls;
 use anyhow::Result;
@@ -203,7 +202,7 @@ async fn handle_client(
                             IpAddr::V4(ip) => NetAddr::new_ipv4(ip, src_addr.port()),
                             IpAddr::V6(ip) => NetAddr::new_ipv6(ip, src_addr.port()),
                         };
-                        let cmd = build_udp_packet(&net_addr, &packet.freeze());
+                        let cmd = build_udp_frame(&net_addr, &packet.freeze());
                         match cmd {
                             Ok(c) => {
                                 if let Err(e) = client_writer.write_all(&c).await {
@@ -212,7 +211,7 @@ async fn handle_client(
                                 }
                             }
                             Err(e) => {
-                                error!("build_udp_packet fail {}", e);
+                                error!("build udp frame fail {}", e);
                             }
                         };
                     }
