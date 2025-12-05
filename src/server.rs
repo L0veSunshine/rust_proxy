@@ -1,3 +1,4 @@
+use crate::protocol::fallback::handle_fallback;
 use crate::protocol::message::{
     Command, Response, build_udp_frame, read_client_request, read_udp_frame, response_to_client,
 };
@@ -10,6 +11,7 @@ use anyhow::Result;
 use bytes::BytesMut;
 use moka::future::Cache;
 use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
+use std::io::Cursor;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +20,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
 use tokio::sync::Notify;
 use tokio_rustls::TlsAcceptor;
-use tracing::error;
+use tracing::{error, info};
 
 pub const UDP_BUFFER_SIZE: usize = 65535;
 pub async fn run(port: u16) -> Result<()> {
@@ -65,14 +67,34 @@ async fn handle_client(
     let stream = acceptor.accept(socket).await?;
     let (mut client_reader, mut client_writer) = tokio::io::split(stream);
 
-    // 读取握手包 (UUID Auth + Padding Skip)
-    let (uuid, cmd, addr) = read_client_request(&mut client_reader).await?;
-    let mut status = Response::Success;
-    if !verify_totp_uuid(SHARED_KEY, &uuid) {
-        status = Response::Unauthorized;
+    let mut peek = vec![0u8; 128];
+    let n = client_reader.read(&mut peek).await?;
+
+    if n == 0 {
+        return Ok(());
     }
 
-    response_to_client(&mut client_writer, &status).await?;
+    let valid_data_peek = &peek[..n];
+    let mut cursor = Cursor::new(valid_data_peek);
+    // 读取握手包 (UUID Auth + Padding Skip)
+    let parse_result = read_client_request(&mut cursor).await;
+    let (uuid, cmd, addr) = match parse_result {
+        Ok(res) => res,
+        Err(e) => {
+            info!("Invalid client hello {}", e);
+            return handle_fallback(valid_data_peek, client_reader, client_writer).await;
+        }
+    };
+
+    if !verify_totp_uuid(SHARED_KEY, &uuid) {
+        return handle_fallback(valid_data_peek, client_reader, client_writer).await;
+    }
+    let consumed = cursor.position() as usize;
+    let remaining = valid_data_peek[consumed..].to_vec();
+
+    let mut chained_reader = AsyncReadExt::chain(Cursor::new(remaining), client_reader);
+
+    response_to_client(&mut client_writer, &Response::Success).await?;
 
     match cmd {
         // === TCP 模式 ===
@@ -119,7 +141,7 @@ async fn handle_client(
             loop {
                 let n = select! {
                     _ = shutdown_tcp_rx_local.notified() => break,
-                    n = client_reader.read(&mut client_to_target_buf) => n
+                    n = chained_reader.read(&mut client_to_target_buf) => n
                 };
                 let length = match n {
                     Ok(0) => break,
@@ -232,7 +254,7 @@ async fn handle_client(
                 loop {
                     let resp = select! {
                         _ = shutdown_rx_2.notified() => break,
-                        resp = read_udp_frame(&mut client_reader) => resp,
+                        resp = read_udp_frame(&mut chained_reader) => resp,
                     };
                     match resp {
                         Ok((addr, payload)) => {
