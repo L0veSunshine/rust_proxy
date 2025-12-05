@@ -166,6 +166,23 @@ impl NetAddr {
         NetAddr::Domain(host, port)
     }
 
+    pub fn addr(&self) -> String {
+        match self {
+            NetAddr::V4(addr, ..) => format!("{}", addr),
+            NetAddr::Domain(host, ..) => host.clone(),
+            NetAddr::V6(addr, ..) => format!("[{}]", addr, ),
+        }
+    }
+
+    pub fn port(&self) -> u16 {
+        let port = match self {
+            NetAddr::V4(_, port) => port,
+            NetAddr::Domain(_, port) => port,
+            NetAddr::V6(_, port) => port,
+        };
+        *port
+    }
+
     /// 从 AsyncRead流中读取并解析地址
     pub async fn read_from<R>(stream: &mut R) -> io::Result<Self>
     where

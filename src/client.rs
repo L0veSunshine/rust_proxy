@@ -1,20 +1,22 @@
-use crate::protocol::message::{Command, build_udp_frame, client_hello, read_udp_frame};
+use crate::protocol::message::{
+    Command, Response, build_udp_frame, client_hello, read_response_from_server, read_udp_frame,
+};
 use crate::protocol::socks5;
 use crate::protocol::socks5::build_udp_packet;
 use crate::protocol::utils::{UUID, bind_dual_stack_udp};
 use crate::tls;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use rustls::pki_types::ServerName;
 use socket2::{SockRef, TcpKeepalive};
 use std::convert::TryFrom;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
 use tokio::sync::{Mutex, Notify};
-use tracing::error;
+use tracing::{error, info};
 
 pub async fn run(listen: &str, server: &str) -> Result<()> {
     let connector = Arc::new(tls::create_client_config("cert.pem")?);
@@ -34,6 +36,24 @@ pub async fn run(listen: &str, server: &str) -> Result<()> {
                 error!("Client Error: {}", e);
             };
         });
+    }
+}
+
+pub async fn handle_response<R: AsyncRead + Unpin>(tls_r: &mut R) -> Result<()> {
+    let resp = read_response_from_server(tls_r).await?;
+    match resp {
+        Response::Success => {
+            info!("build connect succeed");
+            Ok(())
+        }
+        Response::Unauthorized => {
+            info!("build connect failed, reason: unauthorized");
+            bail!("build connect failed, reason: unauthorized");
+        }
+        Response::Rejected => {
+            info!("build connect failed, reason: reject");
+            bail!("build connect failed, reason: reject");
+        }
     }
 }
 
@@ -64,6 +84,9 @@ async fn handle_conn(
                 &target_addr,
             )
             .await?;
+
+            handle_response(&mut tls_r).await?;
+
             let loop_back_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
             socks5::send_reply(&mut local, loop_back_addr).await?;
 
@@ -133,6 +156,8 @@ async fn handle_conn(
                 &target_addr,
             )
             .await?;
+
+            handle_response(&mut tls_r).await?;
 
             // 绑定双栈 Socket (实际上绑定了 [::]:0，同时覆盖 IPv4/IPv6)
             let udp = bind_dual_stack_udp()?;

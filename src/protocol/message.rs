@@ -37,7 +37,7 @@ impl TryFrom<u8> for Command {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum Response {
     Success = 0x01,
     Unauthorized = 0x02,
@@ -47,6 +47,21 @@ pub enum Response {
 impl From<Response> for u8 {
     fn from(r: Response) -> Self {
         r as u8
+    }
+}
+
+impl TryFrom<u8> for Response {
+    type Error = io::Error;
+    fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
+        match value {
+            0x01 => Ok(Response::Success),
+            0x02 => Ok(Response::Unauthorized),
+            0x03 => Ok(Response::Rejected),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Unknown response",
+            )),
+        }
     }
 }
 
@@ -78,8 +93,7 @@ where
     Ok(())
 }
 
-#[allow(unused)]
-pub async fn read_server_response<R>(stream: &mut R) -> Result<(Uuid, Command, NetAddr)>
+pub async fn read_client_request<R>(stream: &mut R) -> Result<(Uuid, Command, NetAddr)>
 where
     R: AsyncRead + Unpin,
 {
@@ -97,16 +111,42 @@ where
     let uuid = Uuid::from_bytes(uuid);
     let cmd = stream.read_u8().await?.try_into()?;
     let addr = NetAddr::read_from(stream).await?;
+
+    // 读 Padding 长度
+    let pad_len = stream.read_u8().await?;
+
+    // 跳过 Padding
+    if pad_len > 0 {
+        let mut limiter = stream.take(pad_len as u64);
+        let mut sink = tokio::io::sink();
+        tokio::io::copy(&mut limiter, &mut sink).await?;
+    }
     Ok((uuid, cmd, addr))
 }
 
-#[allow(unused)]
 pub async fn response_to_client<W>(stream: &mut W, status: &Response) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
+    let random_len = rand::random_range(16..=128);
+    stream.write_u8(random_len + 1).await?;
     stream.write_u8((*status).into()).await?;
+    let padding = vec![0u8; random_len as usize];
+    stream.write_all(&padding).await?;
     Ok(())
+}
+
+pub async fn read_response_from_server<R>(stream: &mut R) -> Result<Response>
+where
+    R: AsyncRead + Unpin,
+{
+    let length = stream.read_u8().await?;
+    let status = stream.read_u8().await?;
+    let padding_length = length as usize - 1;
+    let mut limiter = stream.take(padding_length as u64);
+    let mut sink = tokio::io::sink();
+    tokio::io::copy(&mut limiter, &mut sink).await?;
+    Ok(status.try_into()?)
 }
 
 pub fn build_udp_frame(addr: &NetAddr, payload: &[u8]) -> io::Result<Vec<u8>> {
