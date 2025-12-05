@@ -1,12 +1,13 @@
 use crate::protocol::net_addr::{ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, NetAddr};
-use anyhow::{Result, bail};
+use crate::protocol::utils::generate_gaussian_padding;
+use crate::protocol::var_int::{encode_varint, read_varint};
+use anyhow::{Result, anyhow, bail};
 use std::io;
 use std::io::{Error, ErrorKind};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
-pub const MAGIC: u8 = 0xCD;
 pub const MESSAGE_VERSION: u8 = 0x01;
 
 pub const TYPE: u8 = 0x01;
@@ -70,18 +71,17 @@ where
     W: AsyncWrite + Unpin,
 {
     // 1. Header
-    stream.write_u8(MAGIC).await?; // MAGIC
+    stream.write_all(user_token.as_bytes()).await?; // Token
     stream.write_u8(MESSAGE_VERSION).await?; // Ver
     stream.write_u8(TYPE).await?; // Type
-    stream.write_all(user_token.as_bytes()).await?; // Token
     stream.write_u8(u8::from(*cmd)).await?; // Cmd
 
     // 2. Target Address
     addr.write_to(stream).await?;
 
     // 3. Random Padding
-    let pad_len = rand::random_range(16..=128); // 16-255
-    stream.write_u8(pad_len).await?;
+    let pad_len = generate_gaussian_padding(360.0, 60.0); // 16-255
+    stream.write_u16(pad_len).await?;
 
     let padding = vec![0u8; pad_len as usize];
     stream.write_all(&padding).await?;
@@ -92,23 +92,19 @@ pub async fn read_client_request<R>(stream: &mut R) -> Result<(Uuid, Command, Ne
 where
     R: AsyncRead + Unpin,
 {
-    let header = stream.read_u8().await?;
-    if header != MAGIC {
-        bail!("Unknown protocol");
-    };
+    let mut uuid = [0u8; 16];
+    stream.read_exact(&mut uuid).await?;
     let version = stream.read_u8().await?;
     let type_id = stream.read_u8().await?;
     if version != MESSAGE_VERSION || type_id != TYPE {
         bail!("Unsupported protocol version");
     };
-    let mut uuid = [0u8; 16];
-    stream.read_exact(&mut uuid).await?;
     let uuid = Uuid::from_bytes(uuid);
     let cmd = stream.read_u8().await?.try_into()?;
     let addr = NetAddr::read_from(stream).await?;
 
     // 读 Padding 长度
-    let pad_len = stream.read_u8().await?;
+    let pad_len = stream.read_u16().await?;
 
     // 跳过 Padding
     if pad_len > 0 {
@@ -128,7 +124,11 @@ where
     stream.write_u8((*status).into()).await?;
     let padding = vec![0u8; random_len as usize];
     stream.write_all(&padding).await?;
-    Ok(())
+    match *status {
+        Response::Success => Ok(()),
+        Response::Unauthorized => Err(anyhow!("Unauthorized")),
+        Response::Rejected => Err(anyhow!("Rejected")),
+    }
 }
 
 pub async fn read_response_from_server<R>(stream: &mut R) -> Result<Response>
@@ -155,10 +155,10 @@ pub fn build_udp_frame(addr: &NetAddr, payload: &[u8]) -> io::Result<Vec<u8>> {
     };
     // 构建最终帧
     // 总容量 = 2 (Length) + Addr + Payload
-    let mut frame = Vec::with_capacity(2 + body_len);
+    let mut frame = Vec::with_capacity(3 + body_len);
 
-    // 写入长度 (Big Endian)
-    frame.extend_from_slice(&(body_len as u16).to_be_bytes());
+    // 写入长度
+    encode_varint(body_len as u16, &mut frame);
 
     // 写入地址
     frame.extend_from_slice(&addr_bytes);
@@ -174,9 +174,7 @@ where
     R: AsyncRead + Unpin,
 {
     // 1. 读取 Body Len (2 字节)
-    let mut len_buf = [0u8; 2];
-    stream.read_exact(&mut len_buf).await?;
-    let body_len = u16::from_be_bytes(len_buf) as usize;
+    let body_len = read_varint(stream).await? as usize;
 
     if body_len == 0 {
         return Err(Error::new(ErrorKind::InvalidData, "Empty UDP body"));

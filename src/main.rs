@@ -1,6 +1,7 @@
 mod client;
 mod log;
 mod protocol;
+mod secret;
 mod server;
 mod tls;
 

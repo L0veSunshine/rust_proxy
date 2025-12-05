@@ -3,7 +3,9 @@ use crate::protocol::message::{
 };
 use crate::protocol::socks5;
 use crate::protocol::socks5::build_udp_packet;
-use crate::protocol::utils::{UUID, bind_dual_stack_udp};
+use crate::protocol::utils::bind_dual_stack_udp;
+use crate::secret::SHARED_KEY;
+use crate::secret::totp::generate_totp_uuid;
 use crate::tls;
 use anyhow::{Result, bail};
 use rustls::pki_types::ServerName;
@@ -72,14 +74,14 @@ async fn handle_conn(
 
     // let (tx, mut rx) = mpsc::channel::<Command>(100);
     let (mut tls_r, mut tls_w) = tokio::io::split(tls_stream);
-    let hard_code_uuid = UUID.parse::<uuid::Uuid>()?;
+    let dynamic_uuid = generate_totp_uuid(SHARED_KEY);
 
     match req {
         socks5::SocksRequest::Tcp(target_addr) => {
             // 发送带 Padding 和 Auth 的握手
             client_hello(
                 &mut tls_w,
-                &hard_code_uuid,
+                &dynamic_uuid,
                 &Command::TcpConnect,
                 &target_addr,
             )
@@ -151,7 +153,7 @@ async fn handle_conn(
             // 发送 UDP Associate 握手
             client_hello(
                 &mut tls_w,
-                &hard_code_uuid,
+                &dynamic_uuid,
                 &Command::UdpAssociate,
                 &target_addr,
             )
