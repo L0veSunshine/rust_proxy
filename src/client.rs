@@ -3,7 +3,9 @@ use crate::protocol::message::{
 };
 use crate::protocol::socks5;
 use crate::protocol::socks5::build_udp_packet;
-use crate::protocol::utils::{UUID, bind_dual_stack_udp};
+use crate::protocol::utils::bind_dual_stack_udp;
+use crate::secret::SHARED_KEY;
+use crate::secret::totp::generate_totp_uuid;
 use crate::tls;
 use anyhow::{Result, bail};
 use rustls::pki_types::ServerName;
@@ -72,21 +74,18 @@ async fn handle_conn(
 
     // let (tx, mut rx) = mpsc::channel::<Command>(100);
     let (mut tls_r, mut tls_w) = tokio::io::split(tls_stream);
-    let hard_code_uuid = UUID.parse::<uuid::Uuid>()?;
+    let dynamic_uuid = generate_totp_uuid(SHARED_KEY);
 
     match req {
         socks5::SocksRequest::Tcp(target_addr) => {
             // 发送带 Padding 和 Auth 的握手
             client_hello(
                 &mut tls_w,
-                &hard_code_uuid,
+                &dynamic_uuid,
                 &Command::TcpConnect,
                 &target_addr,
             )
             .await?;
-
-            handle_response(&mut tls_r).await?;
-
             let loop_back_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
             socks5::send_reply(&mut local, loop_back_addr).await?;
 
@@ -125,6 +124,9 @@ async fn handle_conn(
             });
             // 代理 -> 本地
             let mut remote_to_local_buf = vec![0u8; 8192];
+            // 0-RTT
+            handle_response(&mut tls_r).await?;
+
             loop {
                 let n = select! {
                     _ = shutdown_rx_remote.notified() => break,
@@ -151,13 +153,11 @@ async fn handle_conn(
             // 发送 UDP Associate 握手
             client_hello(
                 &mut tls_w,
-                &hard_code_uuid,
+                &dynamic_uuid,
                 &Command::UdpAssociate,
                 &target_addr,
             )
             .await?;
-
-            handle_response(&mut tls_r).await?;
 
             // 绑定双栈 Socket (实际上绑定了 [::]:0，同时覆盖 IPv4/IPv6)
             let udp = bind_dual_stack_udp()?;
@@ -219,6 +219,9 @@ async fn handle_conn(
 
             // --- 任务 B (主线程): 接收 TLS 数据 -> 转发回本地 UDP ---
             let udp_send = udp.clone();
+            // 0-RTT
+            handle_response(&mut tls_r).await?;
+
             loop {
                 select! {
                     _ = shutdown_main.notified() => break,

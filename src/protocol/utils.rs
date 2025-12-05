@@ -1,10 +1,11 @@
 use anyhow::Result;
 use clap::ValueEnum;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
+use std::f64::consts::PI;
 use std::fmt::Display;
 use std::net::{Ipv6Addr, SocketAddr};
-pub const UUID: &str = "8edc51f2-1bf8-42a8-9229-b9014738f617";
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, ValueEnum)]
 pub enum NATType {
@@ -44,4 +45,31 @@ pub fn bind_dual_stack_udp() -> Result<tokio::net::UdpSocket> {
     let tokio_udp = tokio::net::UdpSocket::from_std(std_udp)?;
 
     Ok(tokio_udp)
+}
+
+/// 生成符合高斯分布（正态分布）的 Padding 长度
+///
+/// - `mean`: 均值 (期望的 Padding 大小)
+/// - `std_dev`: 标准差 (数据的离散程度，越大越分散)
+///
+/// 返回值会自动限制在 [0, 65536] 之间以适配 PadLen(u16)
+pub fn generate_gaussian_padding(mean: f64, std_dev: f64) -> u16 {
+    let mut rng = rand::rng();
+
+    // 1. Box-Muller 变换: 从两个均匀分布生成标准正态分布 N(0, 1)
+    let u1: f64 = rng.random();
+    let u2: f64 = rng.random();
+
+    // 避免 u1 为 0 导致 ln(0) = -inf
+    // 虽然概率极低，但在工业级代码中需要处理
+    let u1 = if u1 < f64::EPSILON { f64::EPSILON } else { u1 };
+
+    let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos();
+
+    // 2. 调整为 N(mean, std_dev): X = μ + σZ
+    let value = mean + std_dev * z0;
+
+    // 3. 限制范围并转为 u16
+    // 你的协议 PadLen 是 u16，所以必须截断在 0-65536
+    value.round().clamp(0.0, u16::MAX as f64) as u16
 }

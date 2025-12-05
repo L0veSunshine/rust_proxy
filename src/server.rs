@@ -3,6 +3,8 @@ use crate::protocol::message::{
 };
 use crate::protocol::net_addr::NetAddr;
 use crate::protocol::utils::{NATType, bind_dual_stack_udp};
+use crate::secret::SHARED_KEY;
+use crate::secret::totp::verify_totp_uuid;
 use crate::tls;
 use anyhow::Result;
 use bytes::BytesMut;
@@ -64,8 +66,13 @@ async fn handle_client(
     let (mut client_reader, mut client_writer) = tokio::io::split(stream);
 
     // 读取握手包 (UUID Auth + Padding Skip)
-    let (_, cmd, addr) = read_client_request(&mut client_reader).await?;
-    response_to_client(&mut client_writer, &Response::Success).await?;
+    let (uuid, cmd, addr) = read_client_request(&mut client_reader).await?;
+    let mut status = Response::Success;
+    if !verify_totp_uuid(SHARED_KEY, &uuid) {
+        status = Response::Unauthorized;
+    }
+
+    response_to_client(&mut client_writer, &status).await?;
 
     match cmd {
         // === TCP 模式 ===
