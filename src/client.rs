@@ -4,7 +4,6 @@ use crate::protocol::message::{
 use crate::protocol::socks5;
 use crate::protocol::socks5::build_udp_packet;
 use crate::protocol::utils::bind_dual_stack_udp;
-use crate::secret::SHARED_KEY;
 use crate::secret::totp::generate_totp_uuid;
 use crate::tls;
 use anyhow::{Result, bail};
@@ -20,21 +19,24 @@ use tokio::select;
 use tokio::sync::{Mutex, Notify};
 use tracing::{error, info};
 
-pub async fn run(listen: &str, server: &str) -> Result<()> {
+pub async fn run(listen: &str, server: &str, shared_key: &str) -> Result<()> {
     let connector = Arc::new(tls::create_client_config("cert.pem")?);
     let listener = TcpListener::bind(listen).await?;
     let ka = TcpKeepalive::new().with_time(Duration::from_secs(60)); // 空闲60秒后开始探测
     println!("Client listening on {}", listen);
 
+    let server = Arc::new(String::from(server));
+    let shared_key = Arc::new(String::from(shared_key));
     loop {
         let (socket, _) = listener.accept().await?;
         let native_socket = SockRef::from(&socket);
         native_socket.set_tcp_nodelay(true)?;
         native_socket.set_tcp_keepalive(&ka)?;
-        let server = server.to_string();
+        let server_cloned = server.clone();
+        let shared_key_cloned = shared_key.clone();
         let connector = connector.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(socket, server, connector).await {
+            if let Err(e) = handle_conn(socket, server_cloned, connector, shared_key_cloned).await {
                 error!("Client Error: {}", e);
             };
         });
@@ -61,20 +63,21 @@ pub async fn handle_response<R: AsyncRead + Unpin>(tls_r: &mut R) -> Result<()> 
 
 async fn handle_conn(
     mut local: TcpStream,
-    server: String,
+    server: Arc<String>,
     connector: Arc<tokio_rustls::TlsConnector>,
+    sharked_key: Arc<String>,
 ) -> Result<()> {
     // SOCKS5 握手
     let req = socks5::handshake(&mut local).await?;
 
     // 连接 TLS 服务端
-    let remote = TcpStream::connect(&server).await?;
+    let remote = TcpStream::connect(&*server).await?;
     let domain = ServerName::try_from("localhost")?;
     let tls_stream = connector.connect(domain, remote).await?;
 
     // let (tx, mut rx) = mpsc::channel::<Command>(100);
     let (mut tls_r, mut tls_w) = tokio::io::split(tls_stream);
-    let dynamic_uuid = generate_totp_uuid(SHARED_KEY);
+    let dynamic_uuid = generate_totp_uuid(sharked_key.as_bytes());
 
     match req {
         socks5::SocksRequest::Tcp(target_addr) => {
@@ -200,11 +203,16 @@ async fn handle_conn(
 
                         if let Ok((addr, cursor)) = socks5::parse_udp_packet(&buf[..n]) {
                             let udp_frame = build_udp_frame(&addr, &buf[cursor..n]);
-                            if let Ok(frame) = udp_frame
-                                && let Err(e) = tls_w.write_all(&frame).await
-                            {
-                                error!("Client write udp to proxy server error: {}", e);
-                                break;
+                            match udp_frame {
+                                Ok(frame) => {
+                                    if let Err(e) = tls_w.write_all(&frame).await {
+                                        error!("Client write udp to proxy server error: {}", e);
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to build UDP frame: {}", e);
+                                }
                             }
                         } else {
                             error!("parse udp packet failed");

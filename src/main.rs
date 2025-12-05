@@ -21,6 +21,8 @@ enum Mode {
         port: u16,
     },
     Client {
+        #[arg(long)]
+        key: String,
         #[arg(long, default_value = "127.0.0.1:1080")]
         local: String,
         #[arg(long, default_value = "127.0.0.1:4433")]
@@ -45,6 +47,6 @@ async fn main() -> Result<()> {
 
     match cli.mode {
         Mode::Server { port } => server::run(port).await,
-        Mode::Client { local, remote } => client::run(&local, &remote).await,
+        Mode::Client { local, remote, key } => client::run(&local, &remote, &key).await,
     }
 }
