@@ -1,7 +1,8 @@
-use crate::protocol::net_addr::NetAddr;
-use crate::protocol::socks5::parse_udp_packet;
+use crate::protocol::net_addr::{ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, NetAddr};
 use anyhow::{Result, bail};
 use std::io;
+use std::io::{Error, ErrorKind};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
@@ -23,16 +24,13 @@ impl From<Command> for u8 {
 }
 
 impl TryFrom<u8> for Command {
-    type Error = io::Error;
+    type Error = Error;
 
     fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
         match value {
             0x01 => Ok(Command::TcpConnect),
             0x02 => Ok(Command::UdpAssociate),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Unknown command",
-            )),
+            _ => Err(Error::new(ErrorKind::InvalidInput, "Unknown command")),
         }
     }
 }
@@ -51,16 +49,13 @@ impl From<Response> for u8 {
 }
 
 impl TryFrom<u8> for Response {
-    type Error = io::Error;
+    type Error = Error;
     fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
         match value {
             0x01 => Ok(Response::Success),
             0x02 => Ok(Response::Unauthorized),
             0x03 => Ok(Response::Rejected),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Unknown response",
-            )),
+            _ => Err(Error::new(ErrorKind::InvalidInput, "Unknown response")),
         }
     }
 }
@@ -156,10 +151,7 @@ pub fn build_udp_frame(addr: &NetAddr, payload: &[u8]) -> io::Result<Vec<u8>> {
 
     // UDP 长度字段是 u16，检查溢出
     if body_len > u16::MAX as usize {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "UDP frame too large",
-        ));
+        return Err(Error::new(ErrorKind::InvalidInput, "UDP frame too large"));
     };
     // 构建最终帧
     // 总容量 = 2 (Length) + Addr + Payload
@@ -187,7 +179,7 @@ where
     let body_len = u16::from_be_bytes(len_buf) as usize;
 
     if body_len == 0 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Empty UDP body"));
+        return Err(Error::new(ErrorKind::InvalidData, "Empty UDP body"));
     }
 
     // 2. 读取 Body (包含 Address + Payload)
@@ -195,13 +187,13 @@ where
     stream.read_exact(&mut body).await?;
 
     // 3. 从 Body 头部解析 NetAddr
-    let (addr, consumed_len) = parse_udp_packet(&body)?;
+    let (addr, consumed_len) = parse_addr(&body)?;
 
     // 4. 截取 Payload
     // 剩下的部分就是 Payload
     if consumed_len > body_len {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+        return Err(Error::new(
+            ErrorKind::InvalidData,
             "Parsed address exceeds body length",
         ));
     }
@@ -210,4 +202,58 @@ where
     let payload = body[consumed_len..].to_vec();
 
     Ok((addr, payload))
+}
+
+/// 解析地址部分: ATYP(1) + Addr(Var) + Port(2)
+pub fn parse_addr(data: &[u8]) -> io::Result<(NetAddr, usize)> {
+    if data.is_empty() {
+        return Err(Error::new(ErrorKind::InvalidInput, "Data too short"));
+    }
+
+    let atyp = data[0];
+    // 从 data[1..] 开始解析具体内容
+    let (addr, consumed) = match atyp {
+        ATYP_IPV4 => {
+            if data.len() < 7 {
+                // 1(ATYP) + 4(IP) + 2(Port)
+                return Err(Error::new(ErrorKind::InvalidInput, "Invalid IPv4 packet"));
+            }
+            let ip = Ipv4Addr::from(TryInto::<[u8; 4]>::try_into(&data[1..5]).unwrap());
+            let port = u16::from_be_bytes(data[5..7].try_into().unwrap());
+            (NetAddr::V4(ip, port), 7)
+        }
+        ATYP_DOMAIN => {
+            if data.len() < 2 {
+                return Err(Error::new(ErrorKind::InvalidInput, "Missing domain length"));
+            }
+            let len = data[1] as usize;
+            let total_len = 1 + 1 + len + 2; // ATYP + LenByte + Domain + Port
+
+            if data.len() < total_len {
+                return Err(Error::new(ErrorKind::InvalidInput, "Invalid Domain packet"));
+            }
+
+            let domain = String::from_utf8(data[2..2 + len].to_vec())
+                .map_err(|_| Error::new(ErrorKind::InvalidInput, "Invalid Domain encoding"))?;
+            let port = u16::from_be_bytes(data[2 + len..total_len].try_into().unwrap());
+            (NetAddr::Domain(domain, port), total_len)
+        }
+        ATYP_IPV6 => {
+            if data.len() < 19 {
+                // 1(ATYP) + 16(IP) + 2(Port)
+                return Err(Error::new(ErrorKind::InvalidInput, "Invalid IPv6 packet"));
+            }
+            let ip = Ipv6Addr::from(TryInto::<[u8; 16]>::try_into(&data[1..17]).unwrap());
+            let port = u16::from_be_bytes(data[17..19].try_into().unwrap());
+            (NetAddr::V6(ip, port), 19)
+        }
+        _ => {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Unsupported ATYP: {}", atyp),
+            ));
+        }
+    };
+
+    Ok((addr, consumed))
 }

@@ -200,17 +200,17 @@ async fn handle_conn(
 
                         if let Ok((addr, cursor)) = socks5::parse_udp_packet(&buf[..n]) {
                             let udp_frame = build_udp_frame(&addr, &buf[cursor..n]);
-                            match udp_frame {
-                                Ok(frame) => {
-                                    if let Err(e) = tls_w.write_all(&frame).await {
-                                        error!("Client write udp to proxy server error: {}", e);
-                                        break;
-                                    };
-                                }
-                                Err(_) => break,
+                            if let Ok(frame) = udp_frame
+                                && let Err(e) = tls_w.write_all(&frame).await
+                            {
+                                error!("Client write udp to proxy server error: {}", e);
+                                break;
                             }
+                        } else {
+                            error!("parse udp packet failed");
                         };
                     } else {
+                        error!("Client read udp from local error");
                         break; // UDP 读取错误
                     }
                 }

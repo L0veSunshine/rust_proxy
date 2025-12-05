@@ -213,7 +213,6 @@ async fn handle_client(
                             }
                             Err(e) => {
                                 error!("build_udp_packet fail {}", e);
-                                break;
                             }
                         };
                     }

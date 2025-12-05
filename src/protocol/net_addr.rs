@@ -91,7 +91,9 @@ impl TryFrom<&Vec<u8>> for NetAddr {
                 }
 
                 // 读取 IP
-                let ip_bytes: [u8; 4] = data[cursor..cursor + 4].try_into().unwrap();
+                let ip_bytes: [u8; 4] = data[cursor..cursor + 4]
+                    .try_into()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 let ip = Ipv4Addr::from(ip_bytes);
                 cursor += 4;
 
@@ -137,7 +139,9 @@ impl TryFrom<&Vec<u8>> for NetAddr {
                     ));
                 }
 
-                let ip_bytes: [u8; 16] = data[cursor..cursor + 16].try_into().unwrap();
+                let ip_bytes: [u8; 16] = data[cursor..cursor + 16]
+                    .try_into()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 let ip = Ipv6Addr::from(ip_bytes);
                 cursor += 16;
 
