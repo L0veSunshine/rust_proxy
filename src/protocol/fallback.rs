@@ -3,7 +3,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::select;
 
-pub async fn handle_fallback(
+pub async fn handle_tls_fallback(
     initial_data: &[u8],
     mut client_reader: tokio::io::ReadHalf<tokio_rustls::server::TlsStream<TcpStream>>,
     mut client_writer: tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStream>>,
@@ -31,7 +31,16 @@ pub async fn handle_fallback(
     select! {
         _ = client_to_web => {},
         _ = web_to_client => {},
-    };
+    }
+
+    Ok(())
+}
+
+pub async fn handle_tcp_fallback(mut client_socket: &mut TcpStream) -> Result<()> {
+    let mut web_server = TcpStream::connect("127.0.0.1:80").await?;
+
+    // 使用 copy_bidirectional 进行双向拷贝，比手动 spawn 两个任务更高效简洁
+    tokio::io::copy_bidirectional(&mut client_socket, &mut web_server).await?;
 
     Ok(())
 }

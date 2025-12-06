@@ -1,4 +1,4 @@
-use crate::protocol::fallback::handle_fallback;
+use crate::protocol::fallback::{handle_tcp_fallback, handle_tls_fallback};
 use crate::protocol::message::{
     Command, Response, build_udp_frame, read_client_request, read_udp_frame, response_to_client,
 };
@@ -60,38 +60,60 @@ pub async fn run(port: u16) -> Result<()> {
 }
 
 async fn handle_client(
-    socket: TcpStream,
+    mut socket: TcpStream,
     acceptor: Arc<TlsAcceptor>,
     nat_type: NATType,
 ) -> Result<()> {
+    let mut header_byte = [0u8; 1];
+    let n = socket.peek(&mut header_byte).await?;
+
+    if n > 0 && header_byte[0] != 0x16 {
+        info!("Non-TLS traffic detected, falling back to TCP proxy");
+        return handle_tcp_fallback(&mut socket).await;
+    }
+    // 建立TLS
     let stream = acceptor.accept(socket).await?;
     let (mut client_reader, mut client_writer) = tokio::io::split(stream);
 
     let mut peek = vec![0u8; 1024];
-    let n = client_reader.read(&mut peek).await?;
-
-    if n == 0 {
-        return Ok(());
-    }
-
-    let valid_data_peek = &peek[..n];
-    let mut cursor = Cursor::new(valid_data_peek);
-    // 读取握手包 (UUID Auth + Padding Skip)
-    let parse_result = read_client_request(&mut cursor).await;
-    let (uuid, cmd, addr) = match parse_result {
-        Ok(res) => res,
-        Err(e) => {
-            info!("Invalid client hello {}", e);
-            return handle_fallback(valid_data_peek, client_reader, client_writer).await;
+    let mut offset = 0;
+    let (uuid, cmd, addr, consumed_len) = loop {
+        if offset >= peek.len() {
+            info!("Handshake buffer full, fallback to web");
+            return handle_tls_fallback(&peek, client_reader, client_writer).await;
+        }
+        let n = client_reader.read(&mut peek[offset..]).await?;
+        if n == 0 {
+            return Ok(()); // EOF 连接关闭
+        }
+        offset += n;
+        let valid_data = &peek[..offset];
+        let mut cursor = Cursor::new(valid_data);
+        // 读取握手包 (UUID Auth + Padding Skip)
+        match read_client_request(&mut cursor).await {
+            Ok((uuid, cmd, addr)) => {
+                // 解析成功！跳出循环
+                let consumed = cursor.position() as usize;
+                break (uuid, cmd, addr, consumed);
+            }
+            Err(e) => {
+                // 关键点：如果是数据不够 (UnexpectedEof)，则 continue 继续读
+                // 如果是其他错误 (InvalidData)，则说明协议不对，回落
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    // 数据不够，继续下一轮 read
+                    continue;
+                } else {
+                    info!("Invalid client hello: {}, fallback", e);
+                    return handle_tls_fallback(valid_data, client_reader, client_writer).await;
+                }
+            }
         }
     };
 
     if !verify_totp_uuid(SHARED_KEY, &uuid) {
-        return handle_fallback(valid_data_peek, client_reader, client_writer).await;
+        return handle_tls_fallback(&peek[..offset], client_reader, client_writer).await;
     }
-    let consumed = cursor.position() as usize;
-    let remaining = valid_data_peek[consumed..].to_vec();
-
+    let remaining = peek[consumed_len..offset].to_vec();
     let mut chained_reader = AsyncReadExt::chain(Cursor::new(remaining), client_reader);
 
     response_to_client(&mut client_writer, &Response::Success).await?;

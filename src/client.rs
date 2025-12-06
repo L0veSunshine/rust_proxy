@@ -45,20 +45,14 @@ pub async fn run(listen: &str, server: &str, shared_key: &str) -> Result<()> {
 
 pub async fn handle_response<R: AsyncRead + Unpin>(tls_r: &mut R) -> Result<()> {
     let resp = read_response_from_server(tls_r).await?;
-    match resp {
-        Response::Success => {
-            info!("build connect succeed");
-            Ok(())
-        }
-        Response::Unauthorized => {
-            info!("build connect failed, reason: unauthorized");
-            bail!("build connect failed, reason: unauthorized");
-        }
-        Response::Rejected => {
-            info!("build connect failed, reason: reject");
-            bail!("build connect failed, reason: reject");
-        }
+    if let Ok(resp) = Response::try_from(resp)
+        && resp == Response::Success
+    {
+        info!("build connect succeed");
+        return Ok(());
     }
+    info!("build connect failed");
+    bail!("build connect failed");
 }
 
 async fn handle_conn(
@@ -93,6 +87,8 @@ async fn handle_conn(
             socks5::send_reply(&mut local, loop_back_addr).await?;
 
             let (mut local_r, mut local_w) = local.into_split();
+            // 0-RTT
+            handle_response(&mut tls_r).await?;
 
             let shutdown = Arc::new(Notify::new());
             let shutdown_tx_local = shutdown.clone();
@@ -127,8 +123,6 @@ async fn handle_conn(
             });
             // 代理 -> 本地
             let mut remote_to_local_buf = vec![0u8; 8192];
-            // 0-RTT
-            handle_response(&mut tls_r).await?;
 
             loop {
                 let n = select! {
@@ -177,6 +171,9 @@ async fn handle_conn(
             // 记录本地应用的来源地址 (IP:Port)
             // 只要收到该应用的包，就更新这个地址；收到服务端回包，就发往这个地址
             let client_src = Arc::new(Mutex::new(None::<SocketAddr>));
+
+            // 0-RTT
+            handle_response(&mut tls_r).await?;
 
             let shutdown = Arc::new(Notify::new());
             let shutdown_udp_listener = shutdown.clone();
@@ -227,8 +224,6 @@ async fn handle_conn(
 
             // --- 任务 B (主线程): 接收 TLS 数据 -> 转发回本地 UDP ---
             let udp_send = udp.clone();
-            // 0-RTT
-            handle_response(&mut tls_r).await?;
 
             loop {
                 select! {

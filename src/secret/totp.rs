@@ -61,7 +61,7 @@ fn generate_uuid_at_time(secret: &[u8], timestamp: u64) -> Uuid {
 
     // 4. 截取前 16 bytes 转为 UUID
     // SHA256 的输出看起来是随机的，直接截取前16个字节作为 UUID 是安全的
-    let bytes: [u8; 16] = result[0..16].try_into().unwrap();
+    let bytes: [u8; 16] = result[0..16].try_into().unwrap_or_default();
 
     Uuid::from_bytes(bytes)
 }
