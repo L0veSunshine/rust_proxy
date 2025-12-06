@@ -1,7 +1,7 @@
 use crate::protocol::net_addr::{ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, NetAddr};
 use crate::protocol::utils::generate_gaussian_padding;
 use crate::protocol::var_int::{encode_varint, read_varint};
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use std::io;
 use std::io::{Error, ErrorKind};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -39,8 +39,7 @@ impl TryFrom<u8> for Command {
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum Response {
     Success = 0x01,
-    Unauthorized = 0x02,
-    Rejected = 0x03,
+    Rejected = 0x02,
 }
 
 impl From<Response> for u8 {
@@ -54,8 +53,7 @@ impl TryFrom<u8> for Response {
     fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
         match value {
             0x01 => Ok(Response::Success),
-            0x02 => Ok(Response::Unauthorized),
-            0x03 => Ok(Response::Rejected),
+            0x02 => Ok(Response::Rejected),
             _ => Err(Error::new(ErrorKind::InvalidInput, "Unknown response")),
         }
     }
@@ -66,7 +64,7 @@ pub async fn client_hello<W>(
     user_token: &Uuid,
     cmd: &Command,
     addr: &NetAddr,
-) -> Result<()>
+) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -85,10 +83,11 @@ where
 
     let padding = vec![0u8; pad_len as usize];
     stream.write_all(&padding).await?;
+    stream.flush().await?;
     Ok(())
 }
 
-pub async fn read_client_request<R>(stream: &mut R) -> Result<(Uuid, Command, NetAddr)>
+pub async fn read_client_request<R>(stream: &mut R) -> io::Result<(Uuid, Command, NetAddr)>
 where
     R: AsyncRead + Unpin,
 {
@@ -97,7 +96,10 @@ where
     let version = stream.read_u8().await?;
     let type_id = stream.read_u8().await?;
     if version != MESSAGE_VERSION || type_id != TYPE {
-        bail!("Unsupported protocol version");
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Unsupported protocol version",
+        ));
     };
     let uuid = Uuid::from_bytes(uuid);
     let cmd = stream.read_u8().await?.try_into()?;
@@ -110,7 +112,13 @@ where
     if pad_len > 0 {
         let mut limiter = stream.take(pad_len as u64);
         let mut sink = tokio::io::sink();
-        tokio::io::copy(&mut limiter, &mut sink).await?;
+        let consumed = tokio::io::copy(&mut limiter, &mut sink).await?;
+
+        // 如果 Cursor 里的数据少于 pad_len，说明内存里的包不完整
+        if consumed < pad_len as u64 {
+            // 手动抛出错误，外层 loop 继续读 TCP
+            return Err(Error::from(ErrorKind::UnexpectedEof));
+        }
     }
     Ok((uuid, cmd, addr))
 }
@@ -119,19 +127,21 @@ pub async fn response_to_client<W>(stream: &mut W, status: &Response) -> Result<
 where
     W: AsyncWrite + Unpin,
 {
-    let random_len = rand::random_range(16..=128);
+    let random_len = generate_gaussian_padding(150.0, 25.0).clamp(0, 254) as u8;
     stream.write_u8(random_len + 1).await?;
     stream.write_u8((*status).into()).await?;
-    let padding = vec![0u8; random_len as usize];
-    stream.write_all(&padding).await?;
-    match *status {
+    let padding_buf = [0u8; 128];
+    stream
+        .write_all(&padding_buf[..random_len as usize])
+        .await?;
+    stream.flush().await?;
+    match status {
         Response::Success => Ok(()),
-        Response::Unauthorized => Err(anyhow!("Unauthorized")),
-        Response::Rejected => Err(anyhow!("Rejected")),
+        _ => Err(anyhow!("Unauthorized")),
     }
 }
 
-pub async fn read_response_from_server<R>(stream: &mut R) -> Result<Response>
+pub async fn read_response_from_server<R>(stream: &mut R) -> Result<u8>
 where
     R: AsyncRead + Unpin,
 {
@@ -141,7 +151,7 @@ where
     let mut limiter = stream.take(padding_length as u64);
     let mut sink = tokio::io::sink();
     tokio::io::copy(&mut limiter, &mut sink).await?;
-    Ok(status.try_into()?)
+    Ok(status)
 }
 
 pub fn build_udp_frame(addr: &NetAddr, payload: &[u8]) -> io::Result<Vec<u8>> {
@@ -204,6 +214,10 @@ where
 
 /// 解析地址部分: ATYP(1) + Addr(Var) + Port(2)
 pub fn parse_addr(data: &[u8]) -> io::Result<(NetAddr, usize)> {
+    if data.is_empty() {
+        return Err(Error::new(ErrorKind::InvalidInput, "Data too short"));
+    }
+
     let atyp = data[0];
     let mut cursor = 1;
     match atyp {
