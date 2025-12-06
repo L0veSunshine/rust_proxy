@@ -235,8 +235,13 @@ async fn handle_client(
             let whitelist_recv = whitelist.clone();
 
             tokio::spawn(async move {
-                let mut buf = BytesMut::zeroed(UDP_BUFFER_SIZE);
+                let mut buf = BytesMut::with_capacity(UDP_BUFFER_SIZE);
                 loop {
+                    if buf.capacity() < UDP_BUFFER_SIZE {
+                        buf.reserve(UDP_BUFFER_SIZE);
+                    }
+                    buf.resize(UDP_BUFFER_SIZE, 0);
+
                     let (n, src_addr) = select! {
                         _ = shutdown_rx_1.notified() => break,
                         res = sock_recv.recv_from(&mut buf) => {
