@@ -20,6 +20,10 @@ pub fn generate_totp_uuid(secret: &[u8]) -> Uuid {
     generate_uuid_at_time(secret, now)
 }
 
+pub fn verify_totp_uuids(secret: &[Vec<u8>], token: &Uuid) -> bool {
+    secret.iter().any(|s| verify_totp_uuid(s, token))
+}
+
 /// 验证客户端传来的 UUID 是否有效
 ///
 /// 考虑到网络延迟和时钟偏差，通常允许验证 当前时间窗口 +/- 1 的 Token
@@ -64,4 +68,15 @@ fn generate_uuid_at_time(secret: &[u8], timestamp: u64) -> Uuid {
     let bytes: [u8; 16] = result[0..16].try_into().unwrap_or_default();
 
     Uuid::from_bytes(bytes)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    #[test]
+    fn test_totp_verification() {
+        let secret = b"test_secret_key";
+        let uuid = generate_totp_uuid(secret);
+        assert!(verify_totp_uuid(secret, &uuid));
+    }
 }

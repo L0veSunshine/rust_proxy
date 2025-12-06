@@ -170,6 +170,14 @@ impl NetAddr {
         NetAddr::Domain(host, port)
     }
 
+    pub fn len(&self) -> usize {
+        match self {
+            NetAddr::V4(..) => 7,                           // 1 + 4 + 2
+            NetAddr::Domain(domain, _) => 4 + domain.len(), // 1 + 1 + len + 2
+            NetAddr::V6(..) => 19,                          // 1 + 16 + 2
+        }
+    }
+
     pub fn addr(&self) -> String {
         match self {
             NetAddr::V4(addr, ..) => format!("{}", addr),
@@ -185,6 +193,27 @@ impl NetAddr {
             NetAddr::V6(_, port) => port,
         };
         *port
+    }
+
+    pub fn write_to_buf(&self, buf: &mut Vec<u8>) {
+        match self {
+            NetAddr::V4(ip, port) => {
+                buf.push(0x01);
+                buf.extend_from_slice(&ip.octets());
+                buf.extend_from_slice(&port.to_be_bytes());
+            }
+            NetAddr::Domain(domain, port) => {
+                buf.push(0x03);
+                buf.push(domain.len() as u8);
+                buf.extend_from_slice(domain.as_bytes());
+                buf.extend_from_slice(&port.to_be_bytes());
+            }
+            NetAddr::V6(ip, port) => {
+                buf.push(0x04);
+                buf.extend_from_slice(&ip.octets());
+                buf.extend_from_slice(&port.to_be_bytes());
+            }
+        }
     }
 
     /// 从 AsyncRead流中读取并解析地址

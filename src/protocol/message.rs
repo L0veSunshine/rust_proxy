@@ -2,6 +2,7 @@ use crate::protocol::net_addr::{ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, NetAddr};
 use crate::protocol::utils::generate_gaussian_padding;
 use crate::protocol::var_int::{encode_varint, read_varint};
 use anyhow::{Result, anyhow};
+use bytes::{Bytes, BytesMut};
 use std::io;
 use std::io::{Error, ErrorKind};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -155,9 +156,8 @@ where
 }
 
 pub fn build_udp_frame(addr: &NetAddr, payload: &[u8]) -> io::Result<Vec<u8>> {
-    let addr_bytes: Vec<u8> = addr.into();
     // 计算 Body Len
-    let body_len = addr_bytes.len() + payload.len();
+    let body_len = addr.len() + payload.len();
 
     // UDP 长度字段是 u16，检查溢出
     if body_len > u16::MAX as usize {
@@ -169,17 +169,15 @@ pub fn build_udp_frame(addr: &NetAddr, payload: &[u8]) -> io::Result<Vec<u8>> {
 
     // 写入长度
     encode_varint(body_len as u16, &mut frame);
-
     // 写入地址
-    frame.extend_from_slice(&addr_bytes);
-
+    addr.write_to_buf(&mut frame);
     // 写入 Payload
     frame.extend_from_slice(payload);
 
     Ok(frame)
 }
 
-pub async fn read_udp_frame<R>(stream: &mut R) -> io::Result<(NetAddr, Vec<u8>)>
+pub async fn read_udp_frame<R>(stream: &mut R) -> io::Result<(NetAddr, Bytes)>
 where
     R: AsyncRead + Unpin,
 {
@@ -191,7 +189,7 @@ where
     }
 
     // 2. 读取 Body (包含 Address + Payload)
-    let mut body = vec![0u8; body_len];
+    let mut body = BytesMut::zeroed(body_len);
     stream.read_exact(&mut body).await?;
 
     // 3. 从 Body 头部解析 NetAddr
@@ -207,7 +205,7 @@ where
     }
 
     // 使用 to_vec() 将切片转换为 Vec<u8>
-    let payload = body[consumed_len..].to_vec();
+    let payload = body.freeze().slice(consumed_len..);
 
     Ok((addr, payload))
 }
@@ -298,5 +296,46 @@ pub fn parse_addr(data: &[u8]) -> io::Result<(NetAddr, usize)> {
             ErrorKind::InvalidData,
             format!("Unsupported ATYP: {}", atyp),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[tokio::test]
+    async fn test_read_udp_frame_zero_copy() {
+        // 模拟数据: VarInt(12) + IPv4(7 bytes) + Payload(5 bytes)
+        let data = vec![
+            12, // varint: body_len = 12
+            0x01, 192, 168, 1, 1, // IPv4: 192.168.1.1
+            0x00, 0x50, // Port: 80
+            b'H', b'e', b'l', b'l', b'o', // Payload
+        ];
+
+        let mut cursor = Cursor::new(data);
+        let (addr, payload) = read_udp_frame(&mut cursor).await.unwrap();
+
+        assert_eq!(addr.to_string(), "192.168.1.1:80");
+        assert_eq!(payload.as_ref(), b"Hello");
+
+        // 验证 Bytes 的零拷贝特性
+        let cloned_payload = payload.clone();
+        assert_eq!(cloned_payload.as_ref(), b"Hello");
+        // clone() 只增加引用计数,不拷贝数据
+    }
+
+    #[test]
+    fn test_build_udp_frame_zero_copy() {
+        let addr = NetAddr::V4(Ipv4Addr::new(192, 168, 1, 1), 80);
+        let payload = Bytes::from_static(b"Hello");
+
+        let frame = build_udp_frame(&addr, &payload).unwrap();
+
+        // 验证帧结构
+        assert_eq!(frame[0], 12); // body_len
+        assert_eq!(frame[1], 0x01); // ATYP
+        assert_eq!(&frame[8..], b"Hello"); // payload
     }
 }

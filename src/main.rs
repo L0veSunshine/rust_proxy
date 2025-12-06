@@ -1,12 +1,14 @@
 mod client;
+mod config;
 mod log;
 mod protocol;
 mod secret;
 mod server;
-mod tls;
 
-use anyhow::Result;
+use crate::config::get_shared_keys;
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 struct Cli {
@@ -19,6 +21,8 @@ enum Mode {
     Server {
         #[arg(long, default_value_t = 4433)]
         port: u16,
+        #[arg(long, default_value = "keys.txt")]
+        keys_file: String,
     },
     Client {
         #[arg(long)]
@@ -46,7 +50,16 @@ async fn main() -> Result<()> {
         .init();
 
     match cli.mode {
-        Mode::Server { port } => server::run(port).await,
+        Mode::Server { port, keys_file } => {
+            let keys = match get_shared_keys(&keys_file) {
+                Ok(k) => k,
+                Err(e) => {
+                    bail!("Read keys error: {}", e)
+                }
+            };
+            let arc_keys = Arc::new(keys);
+            server::run(port, arc_keys).await
+        }
         Mode::Client { local, remote, key } => client::run(&local, &remote, &key).await,
     }
 }
