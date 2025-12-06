@@ -14,6 +14,7 @@ jobs:
   # --- 第一步：代码质量检查 ---
   quality_check:
     name: Code Quality Check
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -46,6 +47,7 @@ jobs:
   run_test:
     name: Test
     needs: quality_check
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -72,6 +74,7 @@ jobs:
     name: Build Binary
     needs: run_test
     runs-on: ${{ matrix.os }}
+    if: ${{ always() && (github.event_name == 'push' || needs.run_test.result == 'success') }}
     strategy:
       fail-fast: false
       matrix:
