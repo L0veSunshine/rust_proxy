@@ -54,3 +54,18 @@ pub async fn read_varint<R: AsyncRead + Unpin>(stream: &mut R) -> io::Result<u16
         Ok((mid << 8) | low)
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    #[test]
+    fn test_varint_encoding() {
+        let mut buf = Vec::new();
+        encode_varint(127, &mut buf);
+        assert_eq!(buf.len(), 1);
+
+        buf.clear();
+        encode_varint(16383, &mut buf);
+        assert_eq!(buf.len(), 2);
+    }
+}

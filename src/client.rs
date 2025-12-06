@@ -4,8 +4,8 @@ use crate::protocol::message::{
 use crate::protocol::socks5;
 use crate::protocol::socks5::build_udp_packet;
 use crate::protocol::utils::bind_dual_stack_udp;
+use crate::secret::tls;
 use crate::secret::totp::generate_totp_uuid;
-use crate::tls;
 use anyhow::{Result, bail};
 use rustls::pki_types::ServerName;
 use socket2::{SockRef, TcpKeepalive};

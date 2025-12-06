@@ -4,9 +4,8 @@ use crate::protocol::message::{
 };
 use crate::protocol::net_addr::NetAddr;
 use crate::protocol::utils::{NATType, bind_dual_stack_udp};
-use crate::secret::SHARED_KEY;
-use crate::secret::totp::verify_totp_uuid;
-use crate::tls;
+use crate::secret::tls;
+use crate::secret::totp::verify_totp_uuids;
 use anyhow::Result;
 use bytes::BytesMut;
 use moka::future::Cache;
@@ -19,11 +18,19 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
 use tokio::sync::Notify;
+use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info};
+use uuid::Uuid;
+
+enum HandShakeStatus {
+    Success(Uuid, Command, NetAddr, usize),
+    Fallback,
+    Eof,
+}
 
 pub const UDP_BUFFER_SIZE: usize = 65535;
-pub async fn run(port: u16) -> Result<()> {
+pub async fn run(port: u16, keys: Arc<Vec<Vec<u8>>>) -> Result<()> {
     let acceptor = Arc::new(tls::create_server_config("cert.pem", "key.pem")?);
     // 1. 创建 IPv6 Socket
     let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
@@ -51,8 +58,9 @@ pub async fn run(port: u16) -> Result<()> {
         native_socket.set_tcp_nodelay(true)?;
         native_socket.set_tcp_keepalive(&ka)?;
         let acceptor = acceptor.clone();
+        let key_cloned = keys.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(socket, acceptor, NATType::FullCone).await {
+            if let Err(e) = handle_client(socket, acceptor, NATType::FullCone, key_cloned).await {
                 error!("Server Error: {}", e);
             }
         });
@@ -63,6 +71,7 @@ async fn handle_client(
     mut socket: TcpStream,
     acceptor: Arc<TlsAcceptor>,
     nat_type: NATType,
+    keys: Arc<Vec<Vec<u8>>>,
 ) -> Result<()> {
     let mut header_byte = [0u8; 1];
     let n = socket.peek(&mut header_byte).await?;
@@ -77,40 +86,62 @@ async fn handle_client(
 
     let mut peek = vec![0u8; 1024];
     let mut offset = 0;
-    let (uuid, cmd, addr, consumed_len) = loop {
-        if offset >= peek.len() {
-            info!("Handshake buffer full, fallback to web");
-            return handle_tls_fallback(&peek, client_reader, client_writer).await;
-        }
-        let n = client_reader.read(&mut peek[offset..]).await?;
-        if n == 0 {
-            return Ok(()); // EOF 连接关闭
-        }
-        offset += n;
-        let valid_data = &peek[..offset];
-        let mut cursor = Cursor::new(valid_data);
-        // 读取握手包 (UUID Auth + Padding Skip)
-        match read_client_request(&mut cursor).await {
-            Ok((uuid, cmd, addr)) => {
-                // 解析成功！跳出循环
-                let consumed = cursor.position() as usize;
-                break (uuid, cmd, addr, consumed);
+    let handshake_future = async {
+        loop {
+            if offset >= peek.len() {
+                info!("Handshake buffer full, fallback to web");
+                return Ok(HandShakeStatus::Fallback);
             }
-            Err(e) => {
-                // 关键点：如果是数据不够 (UnexpectedEof)，则 continue 继续读
-                // 如果是其他错误 (InvalidData)，则说明协议不对，回落
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    // 数据不够，继续下一轮 read
-                    continue;
-                } else {
-                    info!("Invalid client hello: {}, fallback", e);
-                    return handle_tls_fallback(valid_data, client_reader, client_writer).await;
+            let n = client_reader.read(&mut peek[offset..]).await?;
+            if n == 0 {
+                return Ok::<HandShakeStatus, std::io::Error>(HandShakeStatus::Eof); // EOF 连接关闭
+            }
+            offset += n;
+            let valid_data = &peek[..offset];
+            let mut cursor = Cursor::new(valid_data);
+            // 读取握手包 (UUID Auth + Padding Skip)
+            match read_client_request(&mut cursor).await {
+                Ok((uuid, cmd, addr)) => {
+                    // 解析成功！跳出循环
+                    let consumed = cursor.position() as usize;
+                    return Ok(HandShakeStatus::Success(uuid, cmd, addr, consumed));
+                }
+                Err(e) => {
+                    // 关键点：如果是数据不够 (UnexpectedEof)，则 continue 继续读
+                    // 如果是其他错误 (InvalidData)，则说明协议不对，回落
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        // 数据不够，继续下一轮 read
+                        continue;
+                    } else {
+                        info!("Invalid client hello: {}, fallback", e);
+                        return Ok(HandShakeStatus::Fallback);
+                    }
                 }
             }
         }
     };
 
-    if !verify_totp_uuid(SHARED_KEY, &uuid) {
+    let handshake_res = timeout(Duration::from_secs(10), handshake_future).await;
+    let (uuid, cmd, addr, consumed_len) = match handshake_res {
+        // 握手超时
+        Err(_) => {
+            // Slowloris protection
+            info!("Handshake timeout");
+            // 超时直接断开，或者也可以选择回落
+            return Ok(());
+        }
+        Ok(Err(e)) => return Err(e.into()),
+        Ok(Ok(res)) => match res {
+            // return Ok(())结束本次链接
+            HandShakeStatus::Eof => return Ok(()),
+            HandShakeStatus::Fallback => {
+                return handle_tls_fallback(&peek[..offset], client_reader, client_writer).await;
+            }
+            HandShakeStatus::Success(uuid, cmd, addr, len) => (uuid, cmd, addr, len),
+        },
+    };
+
+    if !verify_totp_uuids(&keys, &uuid) {
         return handle_tls_fallback(&peek[..offset], client_reader, client_writer).await;
     }
     let remaining = peek[consumed_len..offset].to_vec();
@@ -204,13 +235,8 @@ async fn handle_client(
             let whitelist_recv = whitelist.clone();
 
             tokio::spawn(async move {
-                let mut buf = BytesMut::with_capacity(UDP_BUFFER_SIZE);
+                let mut buf = BytesMut::zeroed(UDP_BUFFER_SIZE);
                 loop {
-                    if buf.capacity() < UDP_BUFFER_SIZE {
-                        buf.reserve(UDP_BUFFER_SIZE);
-                    }
-                    buf.resize(UDP_BUFFER_SIZE, 0);
-
                     let (n, src_addr) = select! {
                         _ = shutdown_rx_1.notified() => break,
                         res = sock_recv.recv_from(&mut buf) => {
@@ -223,6 +249,9 @@ async fn handle_client(
                             }
                         }
                     };
+                    if n == 0 {
+                        break;
+                    }
 
                     let canonical_ip = match src_addr.ip() {
                         IpAddr::V6(v6) => {
