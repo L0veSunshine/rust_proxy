@@ -1,4 +1,7 @@
+use crate::secret::totp::derive_key_id;
+use std::collections::HashMap;
 use std::io::Result;
+use std::sync::Arc;
 
 pub fn get_shared_keys(file_name: &str) -> Result<Vec<Vec<u8>>> {
     let content = std::fs::read_to_string(file_name)?;
@@ -15,4 +18,13 @@ pub fn get_shared_keys(file_name: &str) -> Result<Vec<Vec<u8>>> {
         })
         .collect();
     Ok(keys)
+}
+
+pub fn build_key_map(keys: &[Vec<u8>]) -> Arc<HashMap<[u8; 4], Vec<u8>>> {
+    let mut key_map: HashMap<[u8; 4], Vec<u8>> = HashMap::new();
+    for key in keys.iter() {
+        let id = derive_key_id(key);
+        key_map.entry(id).or_insert(key.clone());
+    }
+    Arc::new(key_map)
 }

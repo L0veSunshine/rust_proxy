@@ -131,7 +131,7 @@ where
     let random_len = generate_gaussian_padding(150.0, 25.0).clamp(0, 254) as u8;
     stream.write_u8(random_len + 1).await?;
     stream.write_u8((*status).into()).await?;
-    let padding_buf = [0u8; 128];
+    let padding_buf = [0u8; 255];
     stream
         .write_all(&padding_buf[..random_len as usize])
         .await?;
