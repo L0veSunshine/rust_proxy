@@ -10,6 +10,7 @@ use anyhow::Result;
 use bytes::BytesMut;
 use moka::future::Cache;
 use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -30,7 +31,7 @@ enum HandShakeStatus {
 }
 
 pub const UDP_BUFFER_SIZE: usize = 65535;
-pub async fn run(port: u16, keys: Arc<Vec<Vec<u8>>>) -> Result<()> {
+pub async fn run(port: u16, keys: Arc<HashMap<[u8; 4], Vec<u8>>>) -> Result<()> {
     let acceptor = Arc::new(tls::create_server_config("cert.pem", "key.pem")?);
     // 1. 创建 IPv6 Socket
     let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
@@ -58,9 +59,10 @@ pub async fn run(port: u16, keys: Arc<Vec<Vec<u8>>>) -> Result<()> {
         native_socket.set_tcp_nodelay(true)?;
         native_socket.set_tcp_keepalive(&ka)?;
         let acceptor = acceptor.clone();
-        let key_cloned = keys.clone();
+        let key_map_cloned = keys.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(socket, acceptor, NATType::FullCone, key_cloned).await {
+            if let Err(e) = handle_client(socket, acceptor, NATType::FullCone, key_map_cloned).await
+            {
                 error!("Server Error: {}", e);
             }
         });
@@ -71,7 +73,7 @@ async fn handle_client(
     mut socket: TcpStream,
     acceptor: Arc<TlsAcceptor>,
     nat_type: NATType,
-    keys: Arc<Vec<Vec<u8>>>,
+    key_map: Arc<HashMap<[u8; 4], Vec<u8>>>,
 ) -> Result<()> {
     let mut header_byte = [0u8; 1];
     let n = socket.peek(&mut header_byte).await?;
@@ -141,7 +143,7 @@ async fn handle_client(
         },
     };
 
-    if !verify_totp_uuids(&keys, &uuid) {
+    if !verify_totp_uuids(key_map, &uuid) {
         return handle_tls_fallback(&peek[..offset], client_reader, client_writer).await;
     }
     let remaining = peek[consumed_len..offset].to_vec();

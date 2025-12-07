@@ -5,10 +5,9 @@ mod protocol;
 mod secret;
 mod server;
 
-use crate::config::get_shared_keys;
+use crate::config::{build_key_map, get_shared_keys};
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 struct Cli {
@@ -21,7 +20,7 @@ enum Mode {
     Server {
         #[arg(long, default_value_t = 4433)]
         port: u16,
-        #[arg(long, default_value = "keys.txt")]
+        #[arg(long, default_value = "keys")]
         keys_file: String,
     },
     Client {
@@ -57,7 +56,7 @@ async fn main() -> Result<()> {
                     bail!("Read keys error: {}", e)
                 }
             };
-            let arc_keys = Arc::new(keys);
+            let arc_keys = build_key_map(&keys);
             server::run(port, arc_keys).await
         }
         Mode::Client { local, remote, key } => client::run(&local, &remote, &key).await,

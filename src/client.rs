@@ -191,6 +191,10 @@ async fn handle_conn(
                         res = udp_recv.recv_from(&mut buf) => res,
                     };
                     if let Ok((n, src)) = result {
+                        if n == 0 {
+                            break;
+                        }
+
                         {
                             let mut guard = client_src_recorder.lock().await;
                             if guard.as_ref() != Some(&src) {
