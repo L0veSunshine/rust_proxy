@@ -1,3 +1,4 @@
+use crate::api::client::{add_download, add_upload};
 use crate::protocol::message::{
     Command, Response, build_udp_frame, client_hello, read_response_from_server, read_udp_frame,
 };
@@ -117,6 +118,7 @@ async fn handle_conn(
                         error!("Client write to server error: {}", e);
                         break;
                     }
+                    add_upload(n);
                 }
                 shutdown_tx_local.notify_one();
                 let _ = tls_w.shutdown().await;
@@ -141,6 +143,7 @@ async fn handle_conn(
                     error!("Client write tcp to local error: {}", e);
                     break;
                 }
+                add_download(length);
             }
             shutdown_tx_remote.notify_one();
             let _ = local_w.shutdown().await;
@@ -210,6 +213,7 @@ async fn handle_conn(
                                         error!("Client write udp to proxy server error: {}", e);
                                         break;
                                     }
+                                    add_upload(n);
                                 }
                                 Err(e) => {
                                     error!("Failed to build UDP frame: {}", e);
@@ -243,6 +247,7 @@ async fn handle_conn(
                                                 error!("Client write udp to local error: {}", e);
                                                 break;
                                             }
+                                            add_download(payload.len());
                                         }
                                         Err(e) => {
                                             error!("Failed to build UDP packet: {}", e);

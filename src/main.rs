@@ -1,3 +1,4 @@
+mod api;
 mod client;
 mod config;
 mod log;
@@ -5,9 +6,12 @@ mod protocol;
 mod secret;
 mod server;
 
+use crate::api::client::start_stat_api;
 use crate::config::{build_key_map, get_shared_keys};
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
+use tokio;
+use crate::api::server::ServerStatistic;
 
 #[derive(Parser, Debug)]
 struct Cli {
@@ -30,6 +34,8 @@ enum Mode {
         local: String,
         #[arg(long, default_value = "127.0.0.1:4433")]
         remote: String,
+        #[arg(long, default_value_t = 1081)]
+        api_port: u16,
     },
 }
 
@@ -57,8 +63,21 @@ async fn main() -> Result<()> {
                 }
             };
             let arc_keys = build_key_map(&keys);
+            let stat_map = ServerStatistic::new();
+            
             server::run(port, arc_keys).await
         }
-        Mode::Client { local, remote, key } => client::run(&local, &remote, &key).await,
+        Mode::Client {
+            local,
+            remote,
+            key,
+            api_port,
+        } => {
+            tokio::spawn(async move {
+                start_stat_api(api_port).await;
+            });
+
+            client::run(&local, &remote, &key).await
+        }
     }
 }
