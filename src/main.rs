@@ -55,7 +55,11 @@ async fn main() -> Result<()> {
         .init();
 
     match cli.mode {
-        Mode::Server { port, keys_file, api_port} => {
+        Mode::Server {
+            port,
+            keys_file,
+            api_port,
+        } => {
             let keys = match get_shared_keys(&keys_file) {
                 Ok(k) => k,
                 Err(e) => {
