@@ -3,7 +3,6 @@ use clap::Parser;
 use rust_proxy::api::client::start_stat_api;
 use rust_proxy::{client, init_logger};
 
-
 #[derive(Parser, Debug)]
 #[command(name = "rust_proxy_client")]
 struct ClientCli {

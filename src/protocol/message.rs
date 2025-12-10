@@ -157,7 +157,7 @@ where
 
 pub fn build_udp_frame(addr: &NetAddr, payload: &[u8]) -> io::Result<Vec<u8>> {
     // 计算 Body Len
-    let body_len = addr.len() + payload.len();
+    let body_len = addr.bytes_len() + payload.len();
 
     // UDP 长度字段是 u16，检查溢出
     if body_len > u16::MAX as usize {
