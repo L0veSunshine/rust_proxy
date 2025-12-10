@@ -160,8 +160,12 @@ async fn handle_client(
     if !verify_totp_uuids(key_map, &uuid) {
         return handle_tls_fallback(&peek[..offset], client_reader, client_writer).await;
     }
-    let key_id = String::from_utf8(uuid.as_bytes()[12..].to_vec())?;
-    let key_id_cloned = String::from_utf8(uuid.as_bytes()[12..].to_vec())?;
+    let bytes_arr = uuid.as_bytes()[12..].to_vec();
+    let key_id = format!(
+        "{:x}{:x}{:x}{:x}",
+        bytes_arr[0], bytes_arr[1], bytes_arr[2], bytes_arr[3]
+    );
+    let key_id_cloned = key_id.clone();
     let stat_map_upload = stat_map.clone();
     let stat_map_download = stat_map.clone();
 
