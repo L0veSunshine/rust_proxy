@@ -1,3 +1,4 @@
+use crate::api::server::ServerStatistic;
 use crate::protocol::fallback::{handle_tcp_fallback, handle_tls_fallback};
 use crate::protocol::message::{
     Command, Response, build_udp_frame, read_client_request, read_udp_frame, response_to_client,
@@ -31,7 +32,11 @@ enum HandShakeStatus {
 }
 
 pub const UDP_BUFFER_SIZE: usize = 65535;
-pub async fn run(port: u16, keys: Arc<HashMap<[u8; 4], Vec<u8>>>) -> Result<()> {
+pub async fn run(
+    port: u16,
+    keys: Arc<HashMap<[u8; 4], Vec<u8>>>,
+    stat_map: Arc<ServerStatistic>,
+) -> Result<()> {
     let acceptor = Arc::new(tls::create_server_config("cert.pem", "key.pem")?);
     // 1. 创建 IPv6 Socket
     let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
@@ -60,8 +65,16 @@ pub async fn run(port: u16, keys: Arc<HashMap<[u8; 4], Vec<u8>>>) -> Result<()> 
         native_socket.set_tcp_keepalive(&ka)?;
         let acceptor = acceptor.clone();
         let key_map_cloned = keys.clone();
+        let stat_map_cloned = stat_map.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(socket, acceptor, NATType::FullCone, key_map_cloned).await
+            if let Err(e) = handle_client(
+                socket,
+                acceptor,
+                NATType::FullCone,
+                key_map_cloned,
+                stat_map_cloned,
+            )
+            .await
             {
                 error!("Server Error: {}", e);
             }
@@ -74,6 +87,7 @@ async fn handle_client(
     acceptor: Arc<TlsAcceptor>,
     nat_type: NATType,
     key_map: Arc<HashMap<[u8; 4], Vec<u8>>>,
+    stat_map: Arc<ServerStatistic>,
 ) -> Result<()> {
     let mut header_byte = [0u8; 1];
     let n = socket.peek(&mut header_byte).await?;
@@ -146,6 +160,11 @@ async fn handle_client(
     if !verify_totp_uuids(key_map, &uuid) {
         return handle_tls_fallback(&peek[..offset], client_reader, client_writer).await;
     }
+    let key_id = String::from_utf8(uuid.as_bytes()[12..].to_vec())?;
+    let key_id_cloned = String::from_utf8(uuid.as_bytes()[12..].to_vec())?;
+    let stat_map_upload = stat_map.clone();
+    let stat_map_download = stat_map.clone();
+
     let remaining = peek[consumed_len..offset].to_vec();
     let mut chained_reader = AsyncReadExt::chain(Cursor::new(remaining), client_reader);
 
@@ -187,6 +206,8 @@ async fn handle_client(
                         error!("Target write to client error {}", e);
                         break;
                     }
+                    let id = key_id.clone();
+                    stat_map_download.update_download(id, length);
                 }
                 shutdown_tcp_tx_remote.notify_one();
             });
@@ -210,6 +231,8 @@ async fn handle_client(
                     error!("Write to target error {}", e);
                     break;
                 }
+                let id = key_id_cloned.clone();
+                stat_map_upload.update_upload(id, length);
             }
             shutdown_tcp_tx_local.notify_one()
         }
@@ -296,6 +319,8 @@ async fn handle_client(
                                     error!("Server write udp to client error {}", e);
                                     break;
                                 }
+                                let id = key_id.clone();
+                                stat_map_download.update_download(id, n);
                             }
                             Err(e) => {
                                 error!("build udp frame fail {}", e);
@@ -329,6 +354,8 @@ async fn handle_client(
                                 error!("Write udp to target error: {:?}", e);
                                 break;
                             };
+                            let id = key_id_cloned.clone();
+                            stat_map_upload.update_upload(id, payload.len());
                         }
                         Err(_) => break,
                     }

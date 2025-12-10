@@ -7,11 +7,11 @@ mod secret;
 mod server;
 
 use crate::api::client::start_stat_api;
+use crate::api::server::{ServerStatistic, start_server_stat_api};
 use crate::config::{build_key_map, get_shared_keys};
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use tokio;
-use crate::api::server::ServerStatistic;
 
 #[derive(Parser, Debug)]
 struct Cli {
@@ -64,8 +64,11 @@ async fn main() -> Result<()> {
             };
             let arc_keys = build_key_map(&keys);
             let stat_map = ServerStatistic::new();
-            
-            server::run(port, arc_keys).await
+            let stat_map_clone = stat_map.clone();
+            tokio::spawn(async move {
+                start_server_stat_api(port, stat_map).await;
+            });
+            server::run(port, arc_keys, stat_map_clone).await
         }
         Mode::Client {
             local,
