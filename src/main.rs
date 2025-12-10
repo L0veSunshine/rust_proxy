@@ -11,8 +11,6 @@ use crate::api::server::{ServerStatistic, start_server_stat_api};
 use crate::config::{build_key_map, get_shared_keys};
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use tokio;
-
 #[derive(Parser, Debug)]
 struct Cli {
     #[command(subcommand)]
