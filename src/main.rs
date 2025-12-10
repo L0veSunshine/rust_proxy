@@ -24,6 +24,8 @@ enum Mode {
         port: u16,
         #[arg(long, default_value = "keys")]
         keys_file: String,
+        #[arg(long, default_value_t = 1081)]
+        api_port: u16,
     },
     Client {
         #[arg(long)]
@@ -53,7 +55,7 @@ async fn main() -> Result<()> {
         .init();
 
     match cli.mode {
-        Mode::Server { port, keys_file } => {
+        Mode::Server { port, keys_file, api_port} => {
             let keys = match get_shared_keys(&keys_file) {
                 Ok(k) => k,
                 Err(e) => {
@@ -64,7 +66,7 @@ async fn main() -> Result<()> {
             let stat_map = ServerStatistic::new();
             let stat_map_clone = stat_map.clone();
             tokio::spawn(async move {
-                start_server_stat_api(port, stat_map).await;
+                start_server_stat_api(api_port, stat_map).await;
             });
             server::run(port, arc_keys, stat_map_clone).await
         }
