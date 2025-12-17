@@ -119,6 +119,8 @@ jobs:
         with:
           name: ${{ env.ARTIFACT_NAME }}
           path: |
-            target/release/rust_proxy
-            target/release/rust_proxy.exe
+            target/release/client
+            target/release/client.exe
+            target/release/server
+            target/release/server.exe
           retention-days: 30
