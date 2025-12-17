@@ -20,8 +20,8 @@ use tokio::select;
 use tokio::sync::{Mutex, Notify};
 use tracing::{error, info};
 
-pub async fn run(listen: &str, server: &str, shared_key: &str) -> Result<()> {
-    let connector = Arc::new(tls::create_client_config("cert.pem")?);
+pub async fn run(listen: &str, server: &str, ca_path: &str, shared_key: &str) -> Result<()> {
+    let connector = Arc::new(tls::create_client_config(ca_path)?);
     let listener = TcpListener::bind(listen).await?;
     let ka = TcpKeepalive::new().with_time(Duration::from_secs(60)); // 空闲60秒后开始探测
     println!("Client listening on {}", listen);

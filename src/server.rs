@@ -1,4 +1,5 @@
 use crate::api::server::ServerStatistic;
+use crate::config::ServerConfig;
 use crate::protocol::fallback::{handle_tcp_fallback, handle_tls_fallback};
 use crate::protocol::message::{
     Command, Response, build_udp_frame, read_client_request, read_udp_frame, response_to_client,
@@ -33,11 +34,14 @@ enum HandShakeStatus {
 
 pub const UDP_BUFFER_SIZE: usize = 65535;
 pub async fn run(
-    port: u16,
+    config: ServerConfig,
     keys: Arc<HashMap<[u8; 4], Vec<u8>>>,
     stat_map: Arc<ServerStatistic>,
 ) -> Result<()> {
-    let acceptor = Arc::new(tls::create_server_config("cert.pem", "key.pem")?);
+    let acceptor = Arc::new(tls::create_server_config(
+        &config.cert_path,
+        &config.key_path,
+    )?);
     // 1. 创建 IPv6 Socket
     let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
     // 2. 关闭 IPV6_V6ONLY，允许 IPv4 映射到这个 IPv6 Socket
@@ -48,7 +52,7 @@ pub async fn run(
     // 4. 设置为非阻塞，适配 Tokio
     socket.set_nonblocking(true)?;
     // 5. 绑定到 [::]:port (同时覆盖 IPv4 和 IPv6)
-    let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
+    let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, config.port));
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
     let listener = TcpListener::from_std(socket.into())?;
@@ -56,7 +60,7 @@ pub async fn run(
         .with_time(Duration::from_secs(60)) // 空闲60秒后开始探测
         .with_interval(Duration::from_secs(10)) // 探测失败后每10秒重试
         .with_retries(3); // 重试3次失败则断开
-    println!("Server listening on [::]:{}", port);
+    println!("Server listening on [::]:{}", config.port);
 
     loop {
         let (socket, _) = listener.accept().await?;

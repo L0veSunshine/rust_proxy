@@ -1,29 +1,17 @@
 use anyhow::{Result, bail};
-use clap::Parser;
 use rust_proxy::api::server::{ServerStatistic, start_server_stat_api};
-use rust_proxy::config::{build_key_map, get_shared_keys};
+use rust_proxy::config::{ServerConfig, build_key_map, get_shared_keys};
 use rust_proxy::{init_logger, server};
-
-#[derive(Parser, Debug)]
-#[command(name = "rust_proxy_server")]
-struct ServerCli {
-    #[arg(long, default_value_t = 4433)]
-    port: u16,
-    #[arg(long, default_value = "keys")]
-    keys_file: String,
-    #[arg(long, default_value_t = 1081)]
-    api_port: u16,
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = ServerCli::parse();
+    let configs = ServerConfig::load("config.toml")?;
 
     // 初始化日志
-    init_logger("server");
+    init_logger(&configs.log_name, &configs.log_level, configs.log_max_size);
 
     // 业务逻辑
-    let keys = match get_shared_keys(&cli.keys_file) {
+    let keys = match get_shared_keys(&configs.users_db) {
         Ok(k) => k,
         Err(e) => bail!("Read keys error: {}", e),
     };
@@ -32,8 +20,8 @@ async fn main() -> Result<()> {
     let stat_map_clone = stat_map.clone();
 
     tokio::spawn(async move {
-        start_server_stat_api(cli.api_port, stat_map).await;
+        start_server_stat_api(configs.api_port, stat_map).await;
     });
 
-    server::run(cli.port, arc_keys, stat_map_clone).await
+    server::run(configs, arc_keys, stat_map_clone).await
 }
