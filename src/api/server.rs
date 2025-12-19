@@ -122,10 +122,10 @@ pub async fn start_api_server(
 ) -> Result<()> {
     let state = Arc::new(AppState { manager, stats });
     let app = Router::new()
-        .route("/online_users", get(handle_list_online_users))
-        .route("/users", post(add_user)) // 创建用户
+        .route("/users", get(handle_list_online_users))
+        .route("/user", post(add_user)) // 创建用户
         .route(
-            "/users/:id",
+            "/user/{id}",
             get(handle_get_user) // 获取单个
                 .put(handle_modify_user) // 修改单个
                 .delete(delete_user),
