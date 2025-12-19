@@ -1,7 +1,10 @@
-use anyhow::{Result, bail};
-use rust_proxy::api::server::{ServerStatistic, start_server_stat_api};
-use rust_proxy::config::{ServerConfig, build_key_map, get_shared_keys};
+use anyhow::Result;
+use rust_proxy::api::common::ServerStatistic;
+use rust_proxy::api::server::start_api_server;
+use rust_proxy::config::ServerConfig;
+use rust_proxy::user_manager::UserManager;
 use rust_proxy::{init_logger, server};
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -10,18 +13,17 @@ async fn main() -> Result<()> {
     // 初始化日志
     init_logger(&configs.log_name, &configs.log_level, configs.log_max_size);
 
-    // 业务逻辑
-    let keys = match get_shared_keys(&configs.users_db) {
-        Ok(k) => k,
-        Err(e) => bail!("Read keys error: {}", e),
-    };
-    let arc_keys = build_key_map(&keys);
+    let user_manager = Arc::new(UserManager::new(&configs.users_db)?);
     let stat_map = ServerStatistic::new();
-    let stat_map_clone = stat_map.clone();
+
+    let api_manager = user_manager.clone();
+    let api_stat_map = stat_map.clone();
 
     tokio::spawn(async move {
-        start_server_stat_api(configs.api_port, stat_map).await;
+        if let Err(e) = start_api_server(configs.api_port, api_stat_map, api_manager).await {
+            tracing::error!("API Server 发生错误: {}", e);
+        }
     });
 
-    server::run(configs, arc_keys, stat_map_clone).await
+    server::run(configs, user_manager, stat_map).await
 }

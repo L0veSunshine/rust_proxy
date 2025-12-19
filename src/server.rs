@@ -1,4 +1,4 @@
-use crate::api::server::ServerStatistic;
+use crate::api::common::ServerStatistic;
 use crate::config::ServerConfig;
 use crate::protocol::fallback::{handle_tcp_fallback, handle_tls_fallback};
 use crate::protocol::message::{
@@ -7,12 +7,12 @@ use crate::protocol::message::{
 use crate::protocol::net_addr::NetAddr;
 use crate::protocol::utils::{NATType, bind_dual_stack_udp};
 use crate::secret::tls;
-use crate::secret::totp::verify_totp_uuids;
+use crate::secret::totp::get_user_profile;
+use crate::user_manager::UserManager;
 use anyhow::Result;
 use bytes::BytesMut;
 use moka::future::Cache;
 use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
-use std::collections::HashMap;
 use std::io::Cursor;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -35,7 +35,7 @@ enum HandShakeStatus {
 pub const UDP_BUFFER_SIZE: usize = 65535;
 pub async fn run(
     config: ServerConfig,
-    keys: Arc<HashMap<[u8; 4], Vec<u8>>>,
+    keys: Arc<UserManager>,
     stat_map: Arc<ServerStatistic>,
 ) -> Result<()> {
     let acceptor = Arc::new(tls::create_server_config(
@@ -68,14 +68,14 @@ pub async fn run(
         native_socket.set_tcp_nodelay(true)?;
         native_socket.set_tcp_keepalive(&ka)?;
         let acceptor = acceptor.clone();
-        let key_map_cloned = keys.clone();
+        let user_manager_cloned = keys.clone();
         let stat_map_cloned = stat_map.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_client(
                 socket,
                 acceptor,
                 NATType::FullCone,
-                key_map_cloned,
+                user_manager_cloned,
                 stat_map_cloned,
             )
             .await
@@ -90,7 +90,7 @@ async fn handle_client(
     mut socket: TcpStream,
     acceptor: Arc<TlsAcceptor>,
     nat_type: NATType,
-    key_map: Arc<HashMap<[u8; 4], Vec<u8>>>,
+    manager: Arc<UserManager>,
     stat_map: Arc<ServerStatistic>,
 ) -> Result<()> {
     let mut header_byte = [0u8; 1];
@@ -100,6 +100,8 @@ async fn handle_client(
         info!("Non-TLS traffic detected, falling back to TCP proxy");
         return handle_tcp_fallback(&mut socket).await;
     }
+
+    let peer_ip = socket.peer_addr()?.ip();
     // 建立TLS
     let stream = acceptor.accept(socket).await?;
     let (mut client_reader, mut client_writer) = tokio::io::split(stream);
@@ -161,10 +163,16 @@ async fn handle_client(
         },
     };
 
-    if !verify_totp_uuids(key_map, &uuid) {
-        return handle_tls_fallback(&peek[..offset], client_reader, client_writer).await;
-    }
-    let bytes_arr = uuid.as_bytes()[12..].to_vec();
+    let bytes_arr: [u8; 4] = uuid.as_bytes()[12..16].try_into().unwrap_or_default();
+
+    let user_profile = match get_user_profile(manager.clone(), &uuid) {
+        Some(p) => p,
+        None => return handle_tls_fallback(&peek[..offset], client_reader, client_writer).await,
+    };
+
+    let _guard = manager.enter_ip(bytes_arr, peer_ip)?;
+    let limiter = manager.get_user_limiter(bytes_arr, user_profile.rate_limit);
+
     let key_id = format!(
         "{:x}{:x}{:x}{:x}",
         bytes_arr[0], bytes_arr[1], bytes_arr[2], bytes_arr[3]
@@ -207,6 +215,14 @@ async fn handle_client(
                             break;
                         }
                     };
+
+                    // 【限速点】: 写入目标服务器之前扣除令牌
+                    if let Some(ref limiter) = limiter
+                        && let Some(nz) = std::num::NonZeroU32::new(length as u32)
+                    {
+                        limiter.until_n_ready(nz).await.ok();
+                    }
+
                     if let Err(e) = client_writer
                         .write_all(&target_to_client_buf[..length])
                         .await
@@ -217,7 +233,7 @@ async fn handle_client(
                     let id = key_id.clone();
                     stat_map_download.update_download(id, length);
                 }
-                shutdown_tcp_tx_remote.notify_one();
+                shutdown_tcp_tx_remote.notify_waiters();
             });
 
             // 客户端 -> 代理 -> 目标
@@ -242,7 +258,7 @@ async fn handle_client(
                 let id = key_id_cloned.clone();
                 stat_map_upload.update_upload(id, length);
             }
-            shutdown_tcp_tx_local.notify_one()
+            shutdown_tcp_tx_local.notify_waiters()
         }
 
         // === UDP 模式 (Full Cone) ===
@@ -323,6 +339,11 @@ async fn handle_client(
                         let cmd = build_udp_frame(&net_addr, &packet.freeze());
                         match cmd {
                             Ok(c) => {
+                                if let Some(ref limiter) = limiter
+                                    && let Some(nz) = std::num::NonZeroU32::new(n as u32)
+                                {
+                                    limiter.until_n_ready(nz).await.ok();
+                                };
                                 if let Err(e) = client_writer.write_all(&c).await {
                                     error!("Server write udp to client error {}", e);
                                     break;
@@ -336,7 +357,7 @@ async fn handle_client(
                         };
                     }
                 }
-                shutdown_tx_1.notify_one();
+                shutdown_tx_1.notify_waiters();
             });
 
             // 客户端 -> 代理 -> 外部
@@ -368,10 +389,11 @@ async fn handle_client(
                         Err(_) => break,
                     }
                 }
-                shutdown_tx_2.notify_one();
+                shutdown_tx_2.notify_waiters();
             });
         }
     }
 
+    // 函数结束时，_guard 被销毁，自动调用 leave_ip
     Ok(())
 }

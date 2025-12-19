@@ -1,143 +1,121 @@
-use crate::protocol::net_addr::NetAddr;
-use dashmap::DashMap;
-use serde::{Serialize, Serializer};
-use std::net::Ipv4Addr;
-use std::ops::Deref;
+use crate::api::common::ServerStatistic;
+use crate::user_manager::{ServiceError, ServiceResult, UserManager};
+use anyhow::Result;
+use axum::{
+    extract::{Path, State}, http::StatusCode,
+    routing::{get, post},
+    Json,
+    Router,
+};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 
-#[derive(Serialize, Default, Debug)]
-pub struct UserTraffic {
-    #[serde(serialize_with = "serialize_atomic")] // 应用自定义序列化
-    pub upload: AtomicU64,
-
-    #[serde(serialize_with = "serialize_atomic")]
-    pub download: AtomicU64,
+pub struct AppState {
+    pub manager: Arc<UserManager>,
+    pub stats: Arc<ServerStatistic>,
 }
+
+#[derive(Deserialize)]
+pub struct UserAction {
+    pub max_ip: u32,
+    pub rate_limit: u64,
+}
+
 #[derive(Serialize)]
-pub struct ServerStatistic(DashMap<String, UserTraffic>);
-
-fn serialize_atomic<S>(x: &AtomicU64, s: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    s.serialize_u64(x.load(Ordering::Relaxed))
+pub struct UserView {
+    pub key_id: String,
+    pub max_ip: u32,
+    pub rate_limit: u64,
 }
 
-impl Deref for ServerStatistic {
-    type Target = DashMap<String, UserTraffic>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+async fn handle_get_user(
+    State(state): State<Arc<AppState>>,
+    Path(id_hex): Path<String>,
+) -> ServiceResult<Json<UserView>> {
+    let key_id = decode_id(&id_hex)?;
+
+    // 调用 service 获取 profile
+    let profile = state.manager.get_user(key_id)?;
+
+    Ok(Json(UserView {
+        key_id: id_hex,
+        max_ip: profile.max_ip,
+        rate_limit: profile.rate_limit,
+    }))
 }
 
-impl ServerStatistic {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self(DashMap::new()))
-    }
+// 修改用户信息
+async fn handle_modify_user(
+    State(state): State<Arc<AppState>>,
+    Path(id_hex): Path<String>,
+    Json(req): Json<UserAction>,
+) -> ServiceResult<StatusCode> {
+    let key_id = decode_id(&id_hex)?;
 
-    pub fn update_upload(&self, user: String, value: usize) {
-        let entry = self.0.entry(user);
-        entry
-            .or_default()
-            .upload
-            .fetch_add(value as u64, Ordering::Relaxed);
-    }
+    // 调用 service 修改数据
+    state
+        .manager
+        .modify_user(key_id, req.max_ip, req.rate_limit)?;
 
-    pub fn update_download(&self, user: String, value: usize) {
-        let entry = self.0.entry(user);
-        entry
-            .or_default()
-            .download
-            .fetch_add(value as u64, Ordering::Relaxed);
-    }
+    Ok(StatusCode::OK)
 }
 
-pub async fn start_server_stat_api(port: u16, stat_map: Arc<ServerStatistic>) {
-    let addr = (Ipv4Addr::LOCALHOST, port);
-    let net_addr = NetAddr::new_ipv4(addr.0, addr.1);
-    let listener = match TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("Server stat server failed to bind {}: {}", net_addr, e);
-            return;
-        }
-    };
+async fn add_user(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<UserAction>,
+) -> ServiceResult<(StatusCode, Json<serde_json::Value>)> {
+    let secret = state.manager.add_user(req.max_ip, req.rate_limit)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "user_uuid": secret })),
+    ))
+}
 
-    println!("Stat API listening on http://{}/stats", net_addr);
-    loop {
-        let map_cloned = stat_map.clone();
-        if let Ok((mut socket, _)) = listener.accept().await {
-            tokio::spawn(async move {
-                let mut buf = [0u8; 1024];
-                // 1. 读取请求数据
-                let n = match socket.read(&mut buf).await {
-                    Ok(n) if n > 0 => n,
-                    _ => return, // 读取失败或连接关闭，直接退出
-                };
+async fn delete_user(
+    State(state): State<Arc<AppState>>,
+    Path(id_hex): Path<String>,
+) -> ServiceResult<StatusCode> {
+    let bytes = hex::decode(&id_hex).map_err(|_| ServiceError::InvalidKeyId)?;
+    let key_id: [u8; 4] = bytes.try_into().map_err(|_| ServiceError::InvalidKeyId)?;
+    state.manager.delete_user(key_id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
 
-                // 2. 简单的 HTTP 解析 (只看第一行)
-                // String::from_utf8_lossy 允许处理可能包含非 UTF-8 字节的请求，避免 panic
-                let request_text = String::from_utf8_lossy(&buf[..n]);
-                let first_line = request_text.lines().next().unwrap_or("");
-                let mut parts = first_line.split_whitespace();
+async fn handle_get_stats(State(state): State<Arc<AppState>>) -> Json<Arc<ServerStatistic>> {
+    // 这里 state.stats 是 Arc<ServerStatistic>
+    // 直接克隆 Arc，它指向的是堆上的同一份数据，不会发生所有权问题
+    Json(state.stats.clone())
+}
 
-                let method = parts.next();
-                let path = parts.next();
+pub async fn start_api_server(
+    port: u16,
+    stats: Arc<ServerStatistic>,
+    manager: Arc<UserManager>,
+) -> Result<()> {
+    let state = Arc::new(AppState { manager, stats });
+    let app = Router::new()
+        .route("/stats", get(handle_get_stats))
+        .route("/users", post(add_user)) // 创建用户
+        .route(
+            "/users/:id",
+            get(handle_get_user) // 获取单个
+                .put(handle_modify_user) // 修改单个
+                .delete(delete_user),
+        ) // 删除单个
+        .with_state(state);
 
-                // 3. 路由分发与响应
-                let response = match (method, path) {
-                    (Some("GET"), Some("/stats")) => {
-                        // === 200 OK: 返回统计数据 ===
+    let addr = format!("127.0.0.1:{}", port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    println!("API server listening on {}", addr);
+    axum::serve(listener, app).await?;
+    Ok(())
+}
 
-                        // 序列化 JSON
-                        let body = serde_json::to_string(&map_cloned).unwrap_or_default();
+fn decode_id(hex_str: &str) -> ServiceResult<[u8; 4]> {
+    // 1. 使用 hex 库将字符串解码为 Vec<u8>
+    let bytes = hex::decode(hex_str).map_err(|_| ServiceError::InvalidKeyId)?;
 
-                        format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: application/json; charset=utf-8\r\n\
-                             Content-Length: {}\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            body.len(),
-                            body
-                        )
-                    }
-                    (Some("GET"), _) => {
-                        // === 404 Not Found: 路径不对 ===
-                        let body = "Not Found";
-                        format!(
-                            "HTTP/1.1 404 Not Found\r\n\
-                             Content-Length: {}\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            body.len(),
-                            body
-                        )
-                    }
-                    _ => {
-                        // === 405 Method Not Allowed: 方法不对或是非法请求 ===
-                        let body = "Method Not Allowed";
-                        format!(
-                            "HTTP/1.1 405 Method Not Allowed\r\n\
-                             Content-Length: {}\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            body.len(),
-                            body
-                        )
-                    }
-                };
-
-                // 4. 发送响应并关闭连接
-                let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.flush().await;
-            });
-        }
-    }
+    // 2. 尝试将 Vec<u8> 转换为固定长度的 [u8; 4]
+    // 如果长度不是 4，说明 ID 格式不对，返回 InvalidKeyId 错误
+    bytes.try_into().map_err(|_| ServiceError::InvalidKeyId)
 }

@@ -16,7 +16,6 @@ rustls-pemfile = "2.2.0"
 uuid = { version = "1.18.1", features = ["v4"] }
 socket2 = "0.6.1"
 moka = { version = "0.12.11", features = ["future"] }
-tokio-util = "0.7.17"
 tracing = "0.1.43"
 tracing-subscriber = "0.3.22"
 tracing-appender = "0.2.4"
@@ -27,4 +26,12 @@ sha2 = "0.10.9"
 serde_json = "1.0.145"
 dashmap = { version = "6.1.0", features = ["serde"] }
 toml = "0.9.9"
+thiserror = "2.0.17"
+axum = "0.8.7"
+http = "1.4.0"
+redb = "3.1.0"
+hex = "0.4.3"
+governor = "0.10.4"
 
+[profile.release]
+lto = true

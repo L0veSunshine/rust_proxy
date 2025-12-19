@@ -6,6 +6,7 @@ pub mod log;
 pub mod protocol;
 pub mod secret;
 pub mod server;
+pub mod user_manager;
 
 // 建议把日志初始化逻辑封装一下，方便 server 和 client 复用
 pub fn init_logger(log_name: &str, level: &str, rotating_size: u64) {

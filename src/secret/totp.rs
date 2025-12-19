@@ -1,9 +1,9 @@
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+use crate::user_manager::{UserManager, UserProfile};
 
 // 使用 HMAC-SHA256
 type HmacSha256 = Hmac<Sha256>;
@@ -30,16 +30,16 @@ pub fn generate_totp_uuid(secret: &[u8]) -> Uuid {
     generate_uuid_at_time(secret, &key_id, now)
 }
 
-pub fn verify_totp_uuids(key_map: Arc<HashMap<[u8; 4], Vec<u8>>>, token: &Uuid) -> bool {
+pub fn get_user_profile(key_map: Arc<UserManager>, token: &Uuid) -> Option<UserProfile> {
     let token_bytes = token.as_bytes();
     // 1. 提取末尾 4 字节作为 KeyID
     // 客户端生成的 UUID: [Random(12) | KeyID(4)]
     let key_id: [u8; 4] = token_bytes[12..16].try_into().unwrap_or_default();
     // 2. 查表：有没有这个用户？
-    if let Some(secret) = key_map.get(&key_id) {
-        return verify_totp_uuid(secret, token);
+    if let Some(profile) = key_map.cache.get(&key_id) && verify_totp_uuid(&profile.secret, token) {
+        return Some(profile.clone());
     }
-    false
+    None
 }
 
 /// 验证客户端传来的 UUID 是否有效
