@@ -302,7 +302,11 @@ impl UserManager {
             .map(|entry| {
                 let key_id = *entry.key();
                 // 提取该用户下所有的活跃 IP
-                let ips: Vec<IpAddr> = entry.value().iter().map(|ip_entry| *ip_entry.key()).collect();
+                let ips: Vec<IpAddr> = entry
+                    .value()
+                    .iter()
+                    .map(|ip_entry| *ip_entry.key())
+                    .collect();
                 (key_id, ips)
             })
             .collect()
