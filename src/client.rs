@@ -120,7 +120,7 @@ async fn handle_conn(
                     }
                     add_upload(n);
                 }
-                shutdown_tx_local.notify_one();
+                shutdown_tx_local.notify_waiters();
                 let _ = tls_w.shutdown().await;
             });
             // 代理 -> 本地
@@ -145,7 +145,7 @@ async fn handle_conn(
                 }
                 add_download(length);
             }
-            shutdown_tx_remote.notify_one();
+            shutdown_tx_remote.notify_waiters();
             let _ = local_w.shutdown().await;
         }
 
@@ -218,7 +218,7 @@ async fn handle_conn(
                         break; // UDP 读取错误
                     }
                 }
-                shutdown_udp_listener.notify_one();
+                shutdown_udp_listener.notify_waiters();
             });
 
             // --- 任务 B (主线程): 接收 TLS 数据 -> 转发回本地 UDP ---
@@ -256,7 +256,7 @@ async fn handle_conn(
                 }
             }
             // 错误或连接关闭，通知其他任务退出
-            shutdown_main.notify_one();
+            shutdown_main.notify_waiters();
         }
     }
     Ok(())

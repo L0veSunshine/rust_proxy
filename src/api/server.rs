@@ -1,11 +1,12 @@
+use std::net::IpAddr;
 use crate::api::common::ServerStatistic;
 use crate::user_manager::{ServiceError, ServiceResult, UserManager};
 use anyhow::Result;
 use axum::{
-    extract::{Path, State}, http::StatusCode,
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
     routing::{get, post},
-    Json,
-    Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -81,10 +82,37 @@ async fn delete_user(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn handle_get_stats(State(state): State<Arc<AppState>>) -> Json<Arc<ServerStatistic>> {
-    // 这里 state.stats 是 Arc<ServerStatistic>
-    // 直接克隆 Arc，它指向的是堆上的同一份数据，不会发生所有权问题
-    Json(state.stats.clone())
+#[derive(Serialize)]
+pub struct OnlineUserView {
+    pub key_id: String,
+    pub ips: Vec<IpAddr>,
+    pub upload: u64,
+    pub download: u64,
+}
+
+async fn handle_list_online_users(State(state): State<Arc<AppState>>) -> Json<Vec<OnlineUserView>> {
+    let online_info = state.manager.list_online_users();
+    let mut result = Vec::with_capacity(online_info.len());
+
+    for (key_id, ips) in online_info {
+        // 从统计地图中获取流量数据
+        let (up, down) = if let Some(traffic) = state.stats.get(&key_id) {
+            (
+                traffic.upload.load(std::sync::atomic::Ordering::Relaxed),
+                traffic.download.load(std::sync::atomic::Ordering::Relaxed),
+            )
+        } else {
+            (0, 0)
+        };
+
+        result.push(OnlineUserView {
+            key_id: hex::encode(key_id),
+            ips,
+            upload: up,
+            download: down,
+        });
+    }
+    Json(result)
 }
 
 pub async fn start_api_server(
@@ -94,7 +122,7 @@ pub async fn start_api_server(
 ) -> Result<()> {
     let state = Arc::new(AppState { manager, stats });
     let app = Router::new()
-        .route("/stats", get(handle_get_stats))
+        .route("/online_users", get(handle_list_online_users))
         .route("/users", post(add_user)) // 创建用户
         .route(
             "/users/:id",

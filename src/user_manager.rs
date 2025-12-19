@@ -1,8 +1,8 @@
 use crate::secret::totp::derive_key_id;
 use axum::{
+    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use dashmap::DashMap;
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
@@ -119,7 +119,7 @@ impl UserManager {
             db,
             cache: Arc::new(DashMap::new()),
             ip_tracker: Arc::new(DashMap::new()),
-            limiters: Arc::new(DashMap::new())
+            limiters: Arc::new(DashMap::new()),
         };
         manager.load_to_cache()?;
         Ok(manager)
@@ -184,14 +184,27 @@ impl UserManager {
         }
     }
 
-    pub fn get_user_limiter(&self, key_id: [u8; 4], rate_limit: u64) -> Option<Arc<DefaultDirectRateLimiter>> {
-        if rate_limit == 0 { return None; }
+    pub fn get_user_limiter(
+        &self,
+        key_id: [u8; 4],
+        rate_limit: u64,
+    ) -> Option<Arc<DefaultDirectRateLimiter>> {
+        if rate_limit == 0 {
+            return None;
+        }
 
         // 如果该用户的限速器已存在，直接返回；否则创建一个新的
-        Some(self.limiters.entry(key_id).or_insert_with(|| {
-            let quota = Quota::per_second(std::num::NonZeroU32::new(rate_limit as u32).unwrap());
-            Arc::new(RateLimiter::direct(quota))
-        }).value().clone())
+        Some(
+            self.limiters
+                .entry(key_id)
+                .or_insert_with(|| {
+                    let quota =
+                        Quota::per_second(std::num::NonZeroU32::new(rate_limit as u32).unwrap());
+                    Arc::new(RateLimiter::direct(quota))
+                })
+                .value()
+                .clone(),
+        )
     }
 
     pub fn add_user(&self, max_ip: u32, rate_limit: u64) -> ServiceResult<String> {
@@ -236,7 +249,6 @@ impl UserManager {
         profile.rate_limit = rate_limit;
 
         self.limiters.remove(&key_id);
-        self.ip_tracker.remove(&key_id);
         // 3. 调用统一的持久化方法同步到 redb 和 cache
         self.persist_user(key_id, profile)
     }
@@ -281,6 +293,19 @@ impl UserManager {
             .map_err(|e| ServiceError::DatabaseError(e.to_string()))?;
         self.cache.insert(key_id, profile);
         Ok(())
+    }
+
+    /// 获取当前所有在线用户的 KeyID 及其 IP 列表
+    pub fn list_online_users(&self) -> Vec<([u8; 4], Vec<IpAddr>)> {
+        self.ip_tracker
+            .iter()
+            .map(|entry| {
+                let key_id = *entry.key();
+                // 提取该用户下所有的活跃 IP
+                let ips: Vec<IpAddr> = entry.value().iter().map(|ip_entry| *ip_entry.key()).collect();
+                (key_id, ips)
+            })
+            .collect()
     }
 
     fn load_to_cache(&self) -> ServiceResult<()> {

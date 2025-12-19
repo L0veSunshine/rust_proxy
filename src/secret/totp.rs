@@ -1,9 +1,9 @@
+use crate::user_manager::{UserManager, UserProfile};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
-use crate::user_manager::{UserManager, UserProfile};
 
 // 使用 HMAC-SHA256
 type HmacSha256 = Hmac<Sha256>;
@@ -36,7 +36,9 @@ pub fn get_user_profile(key_map: Arc<UserManager>, token: &Uuid) -> Option<UserP
     // 客户端生成的 UUID: [Random(12) | KeyID(4)]
     let key_id: [u8; 4] = token_bytes[12..16].try_into().unwrap_or_default();
     // 2. 查表：有没有这个用户？
-    if let Some(profile) = key_map.cache.get(&key_id) && verify_totp_uuid(&profile.secret, token) {
+    if let Some(profile) = key_map.cache.get(&key_id)
+        && verify_totp_uuid(&profile.secret, token)
+    {
         return Some(profile.clone());
     }
     None

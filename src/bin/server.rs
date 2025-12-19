@@ -25,5 +25,21 @@ async fn main() -> Result<()> {
         }
     });
 
+    // 每小时清理不活跃的限速器
+    let manager_for_cleanup = user_manager.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600)); // 每小时
+        loop {
+            interval.tick().await;
+            // 遍历所有限速器
+            // 注意：DashMap 迭代时会持有读锁，生产环境建议分批清理或在低峰期进行
+            manager_for_cleanup.limiters.retain(|key_id, _| {
+                // 如果该用户当前没有活跃 IP 连接，则认为可以清理限速器
+                // 下次用户上线时会重新创建
+                manager_for_cleanup.ip_tracker.contains_key(key_id)
+            });
+        }
+    });
+
     server::run(configs, user_manager, stat_map).await
 }

@@ -163,21 +163,17 @@ async fn handle_client(
         },
     };
 
-    let bytes_arr: [u8; 4] = uuid.as_bytes()[12..16].try_into().unwrap_or_default();
+    let key_sig: [u8; 4] = uuid.as_bytes()[12..16].try_into().unwrap_or_default();
 
     let user_profile = match get_user_profile(manager.clone(), &uuid) {
         Some(p) => p,
         None => return handle_tls_fallback(&peek[..offset], client_reader, client_writer).await,
     };
 
-    let _guard = manager.enter_ip(bytes_arr, peer_ip)?;
-    let limiter = manager.get_user_limiter(bytes_arr, user_profile.rate_limit);
+    let _guard = manager.enter_ip(key_sig, peer_ip)?;
+    let limiter = manager.get_user_limiter(key_sig, user_profile.rate_limit);
+    let limiter_upload = limiter.clone();
 
-    let key_id = format!(
-        "{:x}{:x}{:x}{:x}",
-        bytes_arr[0], bytes_arr[1], bytes_arr[2], bytes_arr[3]
-    );
-    let key_id_cloned = key_id.clone();
     let stat_map_upload = stat_map.clone();
     let stat_map_download = stat_map.clone();
 
@@ -230,8 +226,7 @@ async fn handle_client(
                         error!("Target write to client error {}", e);
                         break;
                     }
-                    let id = key_id.clone();
-                    stat_map_download.update_download(id, length);
+                    stat_map_download.update_download(key_sig, length);
                 }
                 shutdown_tcp_tx_remote.notify_waiters();
             });
@@ -251,12 +246,17 @@ async fn handle_client(
                         break;
                     }
                 };
+                if let Some(ref limiter) = limiter_upload
+                    && let Some(nz) = std::num::NonZeroU32::new(length as u32)
+                {
+                    limiter.until_n_ready(nz).await.ok();
+                };
+
                 if let Err(e) = target_w.write_all(&client_to_target_buf[..length]).await {
                     error!("Write to target error {}", e);
                     break;
                 }
-                let id = key_id_cloned.clone();
-                stat_map_upload.update_upload(id, length);
+                stat_map_upload.update_upload(key_sig, length);
             }
             shutdown_tcp_tx_local.notify_waiters()
         }
@@ -348,8 +348,7 @@ async fn handle_client(
                                     error!("Server write udp to client error {}", e);
                                     break;
                                 }
-                                let id = key_id.clone();
-                                stat_map_download.update_download(id, n);
+                                stat_map_download.update_download(key_sig, n);
                             }
                             Err(e) => {
                                 error!("build udp frame fail {}", e);
@@ -376,6 +375,12 @@ async fn handle_client(
                                 whitelist.insert(addr.to_string(), ()).await;
                             }
 
+                            if let Some(ref limiter) = limiter_upload
+                                && let Some(nz) = std::num::NonZeroU32::new(payload.len() as u32)
+                            {
+                                limiter.until_n_ready(nz).await.ok();
+                            };
+
                             if let Err(e) = sock_send
                                 .send_to(&payload, (addr.addr(), addr.port()))
                                 .await
@@ -383,8 +388,7 @@ async fn handle_client(
                                 error!("Write udp to target error: {:?}", e);
                                 break;
                             };
-                            let id = key_id_cloned.clone();
-                            stat_map_upload.update_upload(id, payload.len());
+                            stat_map_upload.update_upload(key_sig, payload.len());
                         }
                         Err(_) => break,
                     }
