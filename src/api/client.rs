@@ -38,7 +38,8 @@ pub async fn start_stat_api(port: u16) {
         }
     };
 
-    println!("Stat API listening on http://{}/stats", net_addr);
+    println!("stat api server is listening on http://{}/stats", net_addr);
+    tracing::info!("Stat api server started");
 
     loop {
         if let Ok((mut socket, _)) = listener.accept().await {

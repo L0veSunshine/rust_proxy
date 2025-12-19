@@ -180,6 +180,7 @@ async fn handle_client(
     let remaining = peek[consumed_len..offset].to_vec();
     let mut chained_reader = AsyncReadExt::chain(Cursor::new(remaining), client_reader);
 
+    info!("income connection auth success");
     response_to_client(&mut client_writer, &Response::Success).await?;
 
     match cmd {

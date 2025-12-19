@@ -11,7 +11,7 @@ async fn main() -> Result<()> {
     let configs = ServerConfig::load("config.toml")?;
 
     // 初始化日志
-    init_logger(&configs.log_name, &configs.log_level, configs.log_max_size);
+    let _guard = init_logger(&configs.log_name, &configs.log_level, configs.log_max_size);
 
     let user_manager = Arc::new(UserManager::new(&configs.users_db)?);
     let stat_map = ServerStatistic::new();
@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
 
     tokio::spawn(async move {
         if let Err(e) = start_api_server(configs.api_port, api_stat_map, api_manager).await {
-            tracing::error!("API Server 发生错误: {}", e);
+            tracing::error!("api server occur error: {}", e);
         }
     });
 
@@ -29,8 +29,11 @@ async fn main() -> Result<()> {
     let manager_for_cleanup = user_manager.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600)); // 每小时
+        // 关键点：先执行一次 tick，这会立即完成，从而把“下一次”变为 1 小时后
+        interval.tick().await;
         loop {
             interval.tick().await;
+            tracing::info!("limiters has been clear");
             // 遍历所有限速器
             // 注意：DashMap 迭代时会持有读锁，生产环境建议分批清理或在低峰期进行
             manager_for_cleanup.limiters.retain(|key_id, _| {
@@ -41,5 +44,6 @@ async fn main() -> Result<()> {
         }
     });
 
+    tracing::info!("server will start");
     server::run(configs, user_manager, stat_map).await
 }

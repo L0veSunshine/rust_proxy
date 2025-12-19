@@ -19,25 +19,24 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
 use tokio::sync::{Mutex, Notify};
 use tracing::{error, info};
+use uuid::Uuid;
 
-pub async fn run(listen: &str, server: &str, ca_path: &str, shared_key: &str) -> Result<()> {
-    let connector = Arc::new(tls::create_client_config(ca_path)?);
-    let listener = TcpListener::bind(listen).await?;
+pub async fn run(listen: String, server: String, ca_path: String, shared_key: Uuid) -> Result<()> {
+    let connector = Arc::new(tls::create_client_config(&ca_path)?);
+    let listener = TcpListener::bind(&listen).await?;
     let ka = TcpKeepalive::new().with_time(Duration::from_secs(60)); // 空闲60秒后开始探测
     println!("Client listening on {}", listen);
 
-    let server = Arc::new(String::from(server));
-    let shared_key = Arc::new(String::from(shared_key));
+    let server = Arc::new(server);
     loop {
         let (socket, _) = listener.accept().await?;
         let native_socket = SockRef::from(&socket);
         native_socket.set_tcp_nodelay(true)?;
         native_socket.set_tcp_keepalive(&ka)?;
         let server_cloned = server.clone();
-        let shared_key_cloned = shared_key.clone();
         let connector = connector.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(socket, server_cloned, connector, shared_key_cloned).await {
+            if let Err(e) = handle_conn(socket, server_cloned, connector, shared_key).await {
                 error!("Client Error: {}", e);
             };
         });
@@ -60,7 +59,7 @@ async fn handle_conn(
     mut local: TcpStream,
     server: Arc<String>,
     connector: Arc<tokio_rustls::TlsConnector>,
-    sharked_key: Arc<String>,
+    sharked_key: Uuid,
 ) -> Result<()> {
     // SOCKS5 握手
     let req = socks5::handshake(&mut local).await?;

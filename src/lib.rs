@@ -1,4 +1,6 @@
 use tracing::Level;
+use tracing_appender::non_blocking::WorkerGuard;
+
 pub mod api;
 pub mod client;
 pub mod config;
@@ -8,10 +10,9 @@ pub mod secret;
 pub mod server;
 pub mod user_manager;
 
-// 建议把日志初始化逻辑封装一下，方便 server 和 client 复用
-pub fn init_logger(log_name: &str, level: &str, rotating_size: u64) {
+pub fn init_logger(log_name: &str, level: &str, rotating_size: u64) -> WorkerGuard {
     let appender = log::SizeRotatingAppender::new(".", log_name, rotating_size);
-    let (non_blocking, _guard) = tracing_appender::non_blocking(appender);
+    let (non_blocking, guard) = tracing_appender::non_blocking(appender);
 
     let log_level = level.parse::<Level>().unwrap_or(Level::INFO);
 
@@ -21,4 +22,6 @@ pub fn init_logger(log_name: &str, level: &str, rotating_size: u64) {
         .with_target(false)
         .with_max_level(log_level)
         .init();
+
+    guard
 }

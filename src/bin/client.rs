@@ -1,7 +1,9 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::Parser;
 use rust_proxy::api::client::start_stat_api;
 use rust_proxy::{client, default_value, init_logger};
+use tracing::info;
+use uuid::Uuid;
 
 #[derive(Parser, Debug)]
 #[command(name = "rust_proxy_client")]
@@ -27,15 +29,19 @@ default_value!(client_log_rotate_size, u64, 10 * 1024 * 1024);
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = ClientCli::parse();
-
+    // 尝试解析key为UUID
+    let key_uuid = cli
+        .key
+        .parse::<Uuid>()
+        .map_err(|_| anyhow!("error key format"))?;
     // 初始化日志
-    init_logger("client", &cli.log_level, cli.log_rotate_size);
+    let _guard = init_logger("client", &cli.log_level, cli.log_rotate_size);
 
     // 业务逻辑
     tokio::spawn(async move {
         start_stat_api(cli.api_port).await;
     });
 
-    println!("Client connecting to {} via {}", cli.remote, cli.local);
-    client::run(&cli.local, &cli.remote, &cli.ca_path, &cli.key).await
+    info!("Client will connect to remote {}", cli.remote);
+    client::run(cli.local, cli.remote, cli.ca_path, key_uuid).await
 }

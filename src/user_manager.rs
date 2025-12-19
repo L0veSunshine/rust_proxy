@@ -13,6 +13,7 @@ use serde_json::json;
 use std::net::IpAddr;
 use std::sync::Arc;
 use thiserror::Error;
+use tracing::info;
 use uuid::Uuid;
 
 #[derive(Error, Debug)]
@@ -215,7 +216,7 @@ impl UserManager {
         if self.cache.contains_key(&key_id) {
             return Err(ServiceError::UserAlreadyExists(hex::encode(key_id)));
         }
-
+        info!("create user signature is {}", hex::encode(key_id),);
         self.persist_user(
             key_id,
             UserProfile {

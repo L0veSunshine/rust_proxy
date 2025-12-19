@@ -32,6 +32,3 @@ http = "1.4.0"
 redb = "3.1.0"
 hex = "0.4.3"
 governor = "0.10.4"
-
-[profile.release]
-lto = true
