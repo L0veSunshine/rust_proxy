@@ -3,10 +3,10 @@ use crate::user_manager::ServiceError::RequestParamError;
 use crate::user_manager::{ServiceError, ServiceResult, UserManager};
 use anyhow::Result;
 use axum::{
-    extract::{Path, State}, http::StatusCode,
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
     routing::{get, post, put},
-    Json,
-    Router,
 };
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
@@ -76,7 +76,7 @@ async fn add_user(
     )?;
     Ok((
         StatusCode::CREATED,
-        Json(serde_json::json!({ "user_uuid": secret })),
+        Json(serde_json::json!({ "key_id": secret })),
     ))
 }
 
