@@ -132,7 +132,7 @@ impl UserManager {
 
     /// 尝试进入并获取守卫
     pub fn enter_ip(self: &Arc<Self>, key_id: [u8; 4], ip: IpAddr) -> ServiceResult<IpGuard> {
-        let profile = self.get_user(key_id)?; //
+        let profile = self.get_user(key_id)?;
 
         let user_ips = self.ip_tracker.entry(key_id).or_default();
 
@@ -252,7 +252,7 @@ impl UserManager {
                 max_ip: k.max_ip,
                 rate_limit: k.rate_limit,
             })
-            .collect::<Vec<_>>();
+            .collect::<Vec<UserProfile>>();
         Ok(users)
     }
 

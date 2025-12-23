@@ -3,10 +3,10 @@ use crate::user_manager::ServiceError::RequestParamError;
 use crate::user_manager::{ServiceError, ServiceResult, UserManager};
 use anyhow::Result;
 use axum::{
-    Json, Router,
-    extract::{Path, State},
-    http::StatusCode,
-    routing::{get, post},
+    extract::{Path, State}, http::StatusCode,
+    routing::{get, post, put},
+    Json,
+    Router,
 };
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
@@ -38,20 +38,11 @@ pub struct UserView {
     pub rate_limit: u64,
 }
 
-async fn handle_get_user(
-    State(state): State<Arc<AppState>>,
-    Path(id_hex): Path<String>,
-) -> ServiceResult<Json<UserView>> {
-    let key_id = decode_id(&id_hex)?;
-
-    // 调用 service 获取 profile
-    let profile = state.manager.get_user(key_id)?;
-
-    Ok(Json(UserView {
-        key_id: id_hex,
-        max_ip: profile.max_ip,
-        rate_limit: profile.rate_limit,
-    }))
+#[derive(Serialize)]
+pub struct UserProfileView {
+    pub id: String,
+    pub max_ip: u32,
+    pub rate_limit: u64,
 }
 
 // 修改用户信息
@@ -89,11 +80,19 @@ async fn add_user(
     ))
 }
 
-async fn list_all_user(
+async fn list_all_user_profile(
     State(state): State<Arc<AppState>>,
 ) -> ServiceResult<Json<serde_json::Value>> {
     let user_list = state.manager.get_all_users()?;
-    Ok(Json(serde_json::json!({ "user_list": user_list })))
+    let resp = user_list
+        .into_iter()
+        .map(|i| UserProfileView {
+            id: hex::encode(i.secret),
+            max_ip: i.max_ip,
+            rate_limit: i.rate_limit,
+        })
+        .collect::<Vec<UserProfileView>>();
+    Ok(Json(serde_json::json!(resp)))
 }
 
 async fn delete_user(
@@ -147,14 +146,13 @@ pub async fn start_api_server(
     let state = Arc::new(AppState { manager, stats });
     let app = Router::new()
         .route("/status", get(handle_list_online_users))
-        .route("/users", get(list_all_user))
+        .route("/users", get(list_all_user_profile))
         .route("/user", post(add_user)) // 创建用户
         .route(
             "/user/{id}",
-            get(handle_get_user) // 获取单个
-                .put(handle_modify_user) // 修改单个
-                .delete(delete_user),
-        ) // 删除单个
+            put(handle_modify_user) // 修改单个
+                .delete(delete_user), // 删除单个
+        )
         .with_state(state);
 
     let addr = format!("127.0.0.1:{}", port);
