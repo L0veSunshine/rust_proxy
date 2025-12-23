@@ -35,6 +35,9 @@ pub enum ServiceError {
 
     #[error("序列化错误: {0}")]
     SerializationError(#[from] serde_json::Error),
+
+    #[error("请求参数错误")]
+    RequestParamError,
 }
 
 impl IntoResponse for ServiceError {
@@ -44,6 +47,7 @@ impl IntoResponse for ServiceError {
             ServiceError::UserAlreadyExists(_) => (StatusCode::CONFLICT, self.to_string()),
             ServiceError::InvalidKeyId => (StatusCode::BAD_REQUEST, self.to_string()),
             ServiceError::ResourceUseOut => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
+            ServiceError::RequestParamError => (StatusCode::BAD_REQUEST, self.to_string()),
             ServiceError::DatabaseError(e) => {
                 tracing::error!("Database error: {}", e);
                 (
@@ -143,7 +147,7 @@ impl UserManager {
         }
 
         // 2. 如果是新 IP，检查是否超过最大限制
-        if (user_ips.len() as u32) >= profile.max_ip {
+        if profile.max_ip > 0 && (user_ips.len() as u32) >= profile.max_ip {
             return Err(ServiceError::ResourceUseOut);
         }
 
@@ -208,9 +212,8 @@ impl UserManager {
         )
     }
 
-    pub fn add_user(&self, max_ip: u32, rate_limit: u64) -> ServiceResult<String> {
-        let secret_uuid = Uuid::new_v4();
-        let secret_bytes = secret_uuid.as_bytes().to_vec();
+    pub fn add_user(&self, uuid: Uuid, max_ip: u32, rate_limit: u64) -> ServiceResult<String> {
+        let secret_bytes = uuid.as_bytes().to_vec();
         let key_id = derive_key_id(&secret_bytes);
 
         if self.cache.contains_key(&key_id) {
@@ -225,19 +228,41 @@ impl UserManager {
                 rate_limit,
             },
         )?;
-        Ok(secret_uuid.to_string())
+        Ok(hex::encode(key_id))
     }
 
     // [查] 获取单个用户
     pub fn get_user(&self, key_id: [u8; 4]) -> ServiceResult<UserProfile> {
         self.cache
             .get(&key_id)
-            .map(|kv| kv.value().clone())
+            .map(|kv| UserProfile {
+                secret: key_id.to_vec(),
+                max_ip: kv.max_ip,
+                rate_limit: kv.rate_limit,
+            })
             .ok_or_else(|| ServiceError::UserNotFound(hex::encode(key_id)))
     }
 
+    pub fn get_all_users(&self) -> ServiceResult<Vec<UserProfile>> {
+        let users = self
+            .cache
+            .iter()
+            .map(|k| UserProfile {
+                secret: k.key().to_vec(),
+                max_ip: k.max_ip,
+                rate_limit: k.rate_limit,
+            })
+            .collect::<Vec<_>>();
+        Ok(users)
+    }
+
     // [改] 修改现有用户配置
-    pub fn modify_user(&self, key_id: [u8; 4], max_ip: u32, rate_limit: u64) -> ServiceResult<()> {
+    pub fn modify_user(
+        &self,
+        key_id: [u8; 4],
+        max_ip: Option<u32>,
+        rate_limit: Option<u64>,
+    ) -> ServiceResult<()> {
         // 1. 先从缓存检查用户是否存在
         let mut profile = self
             .cache
@@ -246,8 +271,12 @@ impl UserManager {
             .clone();
 
         // 2. 更新字段
-        profile.max_ip = max_ip;
-        profile.rate_limit = rate_limit;
+        if let Some(max_ip) = max_ip {
+            profile.max_ip = max_ip;
+        }
+        if let Some(rate_limit) = rate_limit {
+            profile.rate_limit = rate_limit;
+        }
 
         self.limiters.remove(&key_id);
         // 3. 调用统一的持久化方法同步到 redb 和 cache

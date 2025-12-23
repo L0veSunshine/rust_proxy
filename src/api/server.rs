@@ -1,4 +1,5 @@
 use crate::api::common::ServerStatistic;
+use crate::user_manager::ServiceError::RequestParamError;
 use crate::user_manager::{ServiceError, ServiceResult, UserManager};
 use anyhow::Result;
 use axum::{
@@ -10,6 +11,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::sync::Arc;
+use uuid::Uuid;
 
 pub struct AppState {
     pub manager: Arc<UserManager>,
@@ -17,9 +19,16 @@ pub struct AppState {
 }
 
 #[derive(Deserialize)]
-pub struct UserAction {
-    pub max_ip: u32,
-    pub rate_limit: u64,
+pub struct UserUpdateRequest {
+    pub max_ip: Option<u32>,
+    pub rate_limit: Option<u64>,
+}
+
+#[derive(Deserialize)]
+pub struct UserAdditionRequest {
+    pub uuid: String,
+    pub max_ip: Option<u32>,
+    pub rate_limit: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -49,7 +58,7 @@ async fn handle_get_user(
 async fn handle_modify_user(
     State(state): State<Arc<AppState>>,
     Path(id_hex): Path<String>,
-    Json(req): Json<UserAction>,
+    Json(req): Json<UserUpdateRequest>,
 ) -> ServiceResult<StatusCode> {
     let key_id = decode_id(&id_hex)?;
 
@@ -63,13 +72,28 @@ async fn handle_modify_user(
 
 async fn add_user(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<UserAction>,
+    Json(req): Json<UserAdditionRequest>,
 ) -> ServiceResult<(StatusCode, Json<serde_json::Value>)> {
-    let secret = state.manager.add_user(req.max_ip, req.rate_limit)?;
+    let Ok(uuid) = req.uuid.parse::<Uuid>() else {
+        return Err(RequestParamError);
+    };
+
+    let secret = state.manager.add_user(
+        uuid,
+        req.max_ip.unwrap_or_default(),
+        req.rate_limit.unwrap_or_default(),
+    )?;
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({ "user_uuid": secret })),
     ))
+}
+
+async fn list_all_user(
+    State(state): State<Arc<AppState>>,
+) -> ServiceResult<Json<serde_json::Value>> {
+    let user_list = state.manager.get_all_users()?;
+    Ok(Json(serde_json::json!({ "user_list": user_list })))
 }
 
 async fn delete_user(
@@ -122,7 +146,8 @@ pub async fn start_api_server(
 ) -> Result<()> {
     let state = Arc::new(AppState { manager, stats });
     let app = Router::new()
-        .route("/users", get(handle_list_online_users))
+        .route("/status", get(handle_list_online_users))
+        .route("/users", get(list_all_user))
         .route("/user", post(add_user)) // 创建用户
         .route(
             "/user/{id}",
