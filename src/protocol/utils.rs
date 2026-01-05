@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::f64::consts::PI;
 use std::fmt::Display;
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, ValueEnum)]
 pub enum NATType {
@@ -17,6 +17,19 @@ pub enum NATType {
 impl Display for NATType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self)
+    }
+}
+
+pub fn get_canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => {
+            if let Some(ip) = v6.to_ipv4() {
+                IpAddr::V4(ip)
+            } else {
+                IpAddr::V6(v6)
+            }
+        }
+        v4 => v4,
     }
 }
 

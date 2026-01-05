@@ -5,7 +5,7 @@ use crate::protocol::message::{
     Command, Response, build_udp_frame, read_client_request, read_udp_frame, response_to_client,
 };
 use crate::protocol::net_addr::NetAddr;
-use crate::protocol::utils::{NATType, bind_dual_stack_udp};
+use crate::protocol::utils::{NATType, bind_dual_stack_udp, get_canonical_ip};
 use crate::secret::tls;
 use crate::secret::totp::get_user_profile;
 use crate::user_manager::UserManager;
@@ -170,7 +170,7 @@ async fn handle_client(
         None => return handle_tls_fallback(&peek[..offset], client_reader, client_writer).await,
     };
 
-    let _guard = manager.enter_ip(key_sig, peer_ip)?;
+    let _guard = manager.enter_ip(key_sig, get_canonical_ip(peer_ip))?;
     let limiter = manager.get_user_limiter(key_sig, user_profile.rate_limit);
     let limiter_upload = limiter.clone();
 
@@ -308,16 +308,7 @@ async fn handle_client(
                         break;
                     }
 
-                    let canonical_ip = match src_addr.ip() {
-                        IpAddr::V6(v6) => {
-                            if let Some(v4) = v6.to_ipv4() {
-                                IpAddr::V4(v4)
-                            } else {
-                                IpAddr::V6(v6)
-                            }
-                        }
-                        v4 => v4,
-                    };
+                    let canonical_ip = get_canonical_ip(src_addr.ip());
 
                     let allow = match nat_type {
                         NATType::FullCone => true,
