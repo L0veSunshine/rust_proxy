@@ -50,7 +50,7 @@ macro_rules! default_value {
 default_value!(api_port, u16, 1081);
 default_value!(cert_path, String, String::from("cert.pem"));
 default_value!(key_path, String, String::from("key.pem"));
-default_value!(user_db, String, String::from("users.json"));
+default_value!(user_db, String, String::from("users.db"));
 default_value!(log_level, String, String::from("info"));
 default_value!(log_name, String, String::from("server"));
 default_value!(log_rotate_size, u64, 10 * 1024 * 1024);
