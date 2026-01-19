@@ -82,6 +82,49 @@ async fn handle_conn(
     }
 }
 
+/// 双向数据中继:在两个流之间双向转发数据
+fn relay_bidirectional<R, W>(
+    mut reader: R,
+    mut writer: W,
+    shutdown_tx: Arc<Notify>,
+    shutdown_rx: Arc<Notify>,
+    add_metrics: fn(usize),
+    direction: &'static str,
+) -> tokio::task::JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWriteExt + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let n = select! {
+                _ = shutdown_rx.notified() => 0,
+                res = reader.read(&mut buf) => {
+                    match res {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(e) => {
+                            error!("Client read from {} error: {}", direction, e);
+                            break;
+                        }
+                    }
+                },
+            };
+            if n == 0 {
+                break;
+            }
+            if let Err(e) = writer.write_all(&buf[..n]).await {
+                error!("Client write to {} error: {}", direction, e);
+                break;
+            }
+            add_metrics(n);
+        }
+        shutdown_tx.notify_waiters();
+        let _ = writer.shutdown().await;
+    })
+}
+
 /// 处理 HTTP 代理请求
 async fn handle_http_proxy(
     mut local: TcpStream,
@@ -117,7 +160,7 @@ async fn handle_http_proxy(
             // 发送 HTTP 200 Connection Established 响应
             http::send_connect_success(&mut local).await?;
 
-            let (mut local_r, mut local_w) = local.into_split();
+            let (local_r, local_w) = local.into_split();
 
             let shutdown = Arc::new(Notify::new());
             let shutdown_tx_local = shutdown.clone();
@@ -126,56 +169,27 @@ async fn handle_http_proxy(
             let shutdown_rx_remote = shutdown.clone();
 
             // 本地 -> 代理
-            tokio::spawn(async move {
-                let mut local_to_remote_buf = vec![0u8; 8192];
-                loop {
-                    let n = select! {
-                        _ = shutdown_rx_local.notified() => 0,
-                        res = local_r.read(&mut local_to_remote_buf) => {
-                            match res {
-                                Ok(0) => break,
-                                Ok(n) => n,
-                                Err(e) => {
-                                    error!("Client read from local error: {}", e);
-                                    break;
-                                }
-                            }
-                        },
-                    };
-                    if let Err(e) = tls_w.write_all(&local_to_remote_buf[..n]).await {
-                        error!("Client write to server error: {}", e);
-                        break;
-                    }
-                    add_upload(n);
-                }
-                shutdown_tx_local.notify_waiters();
-                let _ = tls_w.shutdown().await;
-            });
+            let handle_upload = relay_bidirectional(
+                local_r,
+                tls_w,
+                shutdown_tx_local,
+                shutdown_rx_local,
+                add_upload,
+                "local",
+            );
 
             // 代理 -> 本地
-            let mut remote_to_local_buf = vec![0u8; 8192];
+            let handle_download = relay_bidirectional(
+                tls_r,
+                local_w,
+                shutdown_tx_remote,
+                shutdown_rx_remote,
+                add_download,
+                "server",
+            );
 
-            loop {
-                let n = select! {
-                    _ = shutdown_rx_remote.notified() => break,
-                    n = tls_r.read(&mut remote_to_local_buf) => n
-                };
-                let length = match n {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(e) => {
-                        error!("Client read from server error {:}", e);
-                        break;
-                    }
-                };
-                if let Err(e) = local_w.write_all(&remote_to_local_buf[..length]).await {
-                    error!("Client write tcp to local error: {}", e);
-                    break;
-                }
-                add_download(length);
-            }
-            shutdown_tx_remote.notify_waiters();
-            let _ = local_w.shutdown().await;
+            // 等待两个方向的 relay 都完成
+            let _ = tokio::join!(handle_upload, handle_download);
         }
     }
     Ok(())
@@ -213,7 +227,7 @@ async fn handle_socks5_proxy(
             let loop_back_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
             socks5::send_reply(&mut local, loop_back_addr).await?;
 
-            let (mut local_r, mut local_w) = local.into_split();
+            let (local_r, local_w) = local.into_split();
             // 0-RTT
             handle_response(&mut tls_r).await?;
 
@@ -224,55 +238,27 @@ async fn handle_socks5_proxy(
             let shutdown_rx_remote = shutdown.clone();
 
             // 本地 -> 代理
-            tokio::spawn(async move {
-                let mut local_to_remote_buf = vec![0u8; 8192];
-                loop {
-                    let n = select! {
-                        _ = shutdown_rx_local.notified() => 0,
-                        res = local_r.read(&mut local_to_remote_buf) => {
-                            match res {
-                                Ok(0) => break,
-                                Ok(n) => n,
-                                Err(e) => {
-                                    error!("Client read from local error: {}", e);
-                                    break;
-                                }
-                            }
-                        },
-                    };
-                    if let Err(e) = tls_w.write_all(&local_to_remote_buf[..n]).await {
-                        error!("Client write to server error: {}", e);
-                        break;
-                    }
-                    add_upload(n);
-                }
-                shutdown_tx_local.notify_waiters();
-                let _ = tls_w.shutdown().await;
-            });
-            // 代理 -> 本地
-            let mut remote_to_local_buf = vec![0u8; 8192];
+            let handle_upload = relay_bidirectional(
+                local_r,
+                tls_w,
+                shutdown_tx_local,
+                shutdown_rx_local,
+                add_upload,
+                "local",
+            );
 
-            loop {
-                let n = select! {
-                    _ = shutdown_rx_remote.notified() => break,
-                    n = tls_r.read(&mut remote_to_local_buf) => n
-                };
-                let length = match n {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(e) => {
-                        error!("Client read from server error {:}", e);
-                        break;
-                    }
-                };
-                if let Err(e) = local_w.write_all(&remote_to_local_buf[..length]).await {
-                    error!("Client write tcp to local error: {}", e);
-                    break;
-                }
-                add_download(length);
-            }
-            shutdown_tx_remote.notify_waiters();
-            let _ = local_w.shutdown().await;
+            // 代理 -> 本地
+            let handle_download = relay_bidirectional(
+                tls_r,
+                local_w,
+                shutdown_tx_remote,
+                shutdown_rx_remote,
+                add_download,
+                "server",
+            );
+
+            // 等待两个方向的 relay 都完成
+            let _ = tokio::join!(handle_upload, handle_download);
         }
 
         socks5::SocksRequest::Udp(target_addr) => {
