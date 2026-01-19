@@ -1,4 +1,5 @@
 use crate::api::client::{add_download, add_upload};
+use crate::protocol::http;
 use crate::protocol::message::{
     Command, Response, build_udp_frame, client_hello, read_response_from_server, read_udp_frame,
 };
@@ -56,6 +57,132 @@ pub async fn handle_response<R: AsyncRead + Unpin>(tls_r: &mut R) -> Result<()> 
 }
 
 async fn handle_conn(
+    local: TcpStream,
+    server: Arc<String>,
+    connector: Arc<tokio_rustls::TlsConnector>,
+    sharked_key: Uuid,
+) -> Result<()> {
+    // 检测协议类型：peek 第一个字节
+    // SOCKS5: 0x05
+    // HTTP CONNECT: 'C' (0x43)
+    let mut buf = [0u8; 1];
+    local.peek(&mut buf).await?;
+
+    let first_byte = buf[0];
+
+    // 判断是 SOCKS5 还是 HTTP 代理
+    let is_http = first_byte == b'C'; // 'C' for CONNECT
+
+    if is_http {
+        // HTTP 代理处理
+        handle_http_proxy(local, server, connector, sharked_key).await
+    } else {
+        // SOCKS5 代理处理
+        handle_socks5_proxy(local, server, connector, sharked_key).await
+    }
+}
+
+/// 处理 HTTP 代理请求
+async fn handle_http_proxy(
+    mut local: TcpStream,
+    server: Arc<String>,
+    connector: Arc<tokio_rustls::TlsConnector>,
+    sharked_key: Uuid,
+) -> Result<()> {
+    // HTTP 握手
+    let req = http::handshake(&mut local).await?;
+
+    // 连接 TLS 服务端
+    let remote = TcpStream::connect(&*server).await?;
+    let domain = ServerName::try_from("localhost")?;
+    let tls_stream = connector.connect(domain, remote).await?;
+
+    let (mut tls_r, mut tls_w) = tokio::io::split(tls_stream);
+    let dynamic_uuid = generate_totp_uuid(sharked_key.as_bytes());
+
+    match req {
+        http::HttpRequest::Connect(target_addr) => {
+            // 发送带 Padding 和 Auth 的握手
+            client_hello(
+                &mut tls_w,
+                &dynamic_uuid,
+                &Command::TcpConnect,
+                &target_addr,
+            )
+            .await?;
+
+            // 0-RTT
+            handle_response(&mut tls_r).await?;
+
+            // 发送 HTTP 200 Connection Established 响应
+            http::send_connect_success(&mut local).await?;
+
+            let (mut local_r, mut local_w) = local.into_split();
+
+            let shutdown = Arc::new(Notify::new());
+            let shutdown_tx_local = shutdown.clone();
+            let shutdown_rx_local = shutdown.clone();
+            let shutdown_tx_remote = shutdown.clone();
+            let shutdown_rx_remote = shutdown.clone();
+
+            // 本地 -> 代理
+            tokio::spawn(async move {
+                let mut local_to_remote_buf = vec![0u8; 8192];
+                loop {
+                    let n = select! {
+                        _ = shutdown_rx_local.notified() => 0,
+                        res = local_r.read(&mut local_to_remote_buf) => {
+                            match res {
+                                Ok(0) => break,
+                                Ok(n) => n,
+                                Err(e) => {
+                                    error!("Client read from local error: {}", e);
+                                    break;
+                                }
+                            }
+                        },
+                    };
+                    if let Err(e) = tls_w.write_all(&local_to_remote_buf[..n]).await {
+                        error!("Client write to server error: {}", e);
+                        break;
+                    }
+                    add_upload(n);
+                }
+                shutdown_tx_local.notify_waiters();
+                let _ = tls_w.shutdown().await;
+            });
+
+            // 代理 -> 本地
+            let mut remote_to_local_buf = vec![0u8; 8192];
+
+            loop {
+                let n = select! {
+                    _ = shutdown_rx_remote.notified() => break,
+                    n = tls_r.read(&mut remote_to_local_buf) => n
+                };
+                let length = match n {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) => {
+                        error!("Client read from server error {:}", e);
+                        break;
+                    }
+                };
+                if let Err(e) = local_w.write_all(&remote_to_local_buf[..length]).await {
+                    error!("Client write tcp to local error: {}", e);
+                    break;
+                }
+                add_download(length);
+            }
+            shutdown_tx_remote.notify_waiters();
+            let _ = local_w.shutdown().await;
+        }
+    }
+    Ok(())
+}
+
+/// 处理 SOCKS5 代理请求
+async fn handle_socks5_proxy(
     mut local: TcpStream,
     server: Arc<String>,
     connector: Arc<tokio_rustls::TlsConnector>,
