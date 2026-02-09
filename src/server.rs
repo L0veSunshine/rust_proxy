@@ -281,10 +281,9 @@ async fn handle_client(
 
             // 外部 -> 代理 -> 客户端
             let sock_recv = socket.clone();
-
             let whitelist_recv = whitelist.clone();
 
-            tokio::spawn(async move {
+            let inbound_task = tokio::spawn(async move {
                 let mut buf = BytesMut::with_capacity(UDP_BUFFER_SIZE);
                 loop {
                     if buf.capacity() < UDP_BUFFER_SIZE {
@@ -353,7 +352,7 @@ async fn handle_client(
 
             // 客户端 -> 代理 -> 外部
             let sock_send = socket.clone();
-            tokio::spawn(async move {
+            let outbound_task = tokio::spawn(async move {
                 loop {
                     let resp = select! {
                         _ = shutdown_rx_2.notified() => break,
@@ -387,6 +386,9 @@ async fn handle_client(
                 }
                 shutdown_tx_2.notify_waiters();
             });
+
+            // 等待任意一个方向结束
+            let _ = tokio::join!(inbound_task, outbound_task);
         }
     }
 
