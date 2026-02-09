@@ -71,7 +71,10 @@ async fn handle_conn(
     let first_byte = buf[0];
 
     // 判断是 SOCKS5 还是 HTTP 代理
-    let is_http = first_byte == b'C'; // 'C' for CONNECT
+    // SOCKS5 版本号固定为 0x05
+    // HTTP 方法通常以 ASCII 字符开头 (G, P, C, D, H, O, T 等)
+    // 所以只要不是 0x05，我们就认为是 HTTP 流量
+    let is_http = first_byte != 0x05;
 
     if is_http {
         // HTTP 代理处理
@@ -159,6 +162,60 @@ async fn handle_http_proxy(
 
             // 发送 HTTP 200 Connection Established 响应
             http::send_connect_success(&mut local).await?;
+
+            let (local_r, local_w) = local.into_split();
+
+            let shutdown = Arc::new(Notify::new());
+            let shutdown_tx_local = shutdown.clone();
+            let shutdown_rx_local = shutdown.clone();
+            let shutdown_tx_remote = shutdown.clone();
+            let shutdown_rx_remote = shutdown.clone();
+
+            // 本地 -> 代理
+            let handle_upload = relay_bidirectional(
+                local_r,
+                tls_w,
+                shutdown_tx_local,
+                shutdown_rx_local,
+                add_upload,
+                "local",
+            );
+
+            // 代理 -> 本地
+            let handle_download = relay_bidirectional(
+                tls_r,
+                local_w,
+                shutdown_tx_remote,
+                shutdown_rx_remote,
+                add_download,
+                "server",
+            );
+
+            // 等待两个方向的 relay 都完成
+            let _ = tokio::join!(handle_upload, handle_download);
+        }
+        http::HttpRequest::Http(target_addr, initial_data) => {
+            // 发送带 Padding 和 Auth 的握手
+            client_hello(
+                &mut tls_w,
+                &dynamic_uuid,
+                &Command::TcpConnect,
+                &target_addr,
+            )
+            .await?;
+
+            // 0-RTT
+            handle_response(&mut tls_r).await?;
+
+            // HTTP 代理不需要发送 200 Connection Established
+            // 但需要把握手期间读取的 initial_data (请求行+头部) 转发给服务端
+            if let Err(e) = tls_w.write_all(&initial_data).await {
+                error!(
+                    "Client write initial http data to proxy server error: {}",
+                    e
+                );
+                return Err(anyhow::anyhow!("Failed to write initial data"));
+            }
 
             let (local_r, local_w) = local.into_split();
 

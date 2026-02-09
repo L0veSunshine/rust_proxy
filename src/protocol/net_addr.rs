@@ -173,7 +173,7 @@ impl NetAddr {
     pub fn bytes_len(&self) -> usize {
         match self {
             NetAddr::V4(..) => 7,                           // 1 + 4 + 2
-            NetAddr::Domain(domain, _) => 4 + domain.len(), // 1 + 1 + len + 2
+            NetAddr::Domain(domain, ..) => 4 + domain.len(), // 1 + 1 + len + 2
             NetAddr::V6(..) => 19,                          // 1 + 16 + 2
         }
     }
