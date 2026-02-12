@@ -1,4 +1,5 @@
 pub mod fallback;
+pub mod http;
 pub mod message;
 pub mod net_addr;
 pub mod socks5;

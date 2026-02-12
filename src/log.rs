@@ -35,7 +35,11 @@ impl SizeRotatingAppender {
     /// 格式：directory/prefix.YYYY-MM-DD.log
     fn get_active_file_path(&self) -> PathBuf {
         let date = Local::now().format("%Y-%m-%d").to_string();
-        Path::new(&self.directory).join(format!("{}.{}.log", self.prefix, date))
+        let mut file_name = format!("{}.{}", self.prefix, date);
+        if !file_name.ends_with(".log") {
+            file_name.push_str(".log");
+        }
+        Path::new(&self.directory).join(file_name)
     }
 
     /// 执行轮转：重命名 -> 开新文件 -> 后台压缩
