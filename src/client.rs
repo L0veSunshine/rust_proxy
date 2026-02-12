@@ -49,10 +49,9 @@ pub async fn handle_response<R: AsyncRead + Unpin>(tls_r: &mut R) -> Result<()> 
     if let Ok(resp) = Response::try_from(resp)
         && resp == Response::Success
     {
-        info!("build connect succeed");
         return Ok(());
     }
-    info!("build connect failed");
+    error!("build connect failed");
     bail!("build connect failed");
 }
 
@@ -148,6 +147,7 @@ async fn handle_http_proxy(
 
     match req {
         http::HttpRequest::Connect(target_addr) => {
+            info!("HTTPS connect to: {}", target_addr);
             // 发送带 Padding 和 Auth 的握手
             client_hello(
                 &mut tls_w,
@@ -195,6 +195,7 @@ async fn handle_http_proxy(
             let _ = tokio::join!(handle_upload, handle_download);
         }
         http::HttpRequest::Http(target_addr, initial_data) => {
+            info!("HTTP connect to: {}", target_addr);
             // 发送带 Padding 和 Auth 的握手
             client_hello(
                 &mut tls_w,
@@ -273,6 +274,7 @@ async fn handle_socks5_proxy(
 
     match req {
         socks5::SocksRequest::Tcp(target_addr) => {
+            info!("SOCK5 Tcp connect to {}", target_addr);
             // 发送带 Padding 和 Auth 的握手
             client_hello(
                 &mut tls_w,
@@ -320,6 +322,7 @@ async fn handle_socks5_proxy(
 
         socks5::SocksRequest::Udp(target_addr) => {
             // 发送 UDP Associate 握手
+            info!("SOCK5 Udp connect to {}", target_addr);
             client_hello(
                 &mut tls_w,
                 &dynamic_uuid,

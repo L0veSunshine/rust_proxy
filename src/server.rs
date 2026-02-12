@@ -180,13 +180,13 @@ async fn handle_client(
     let remaining = peek[consumed_len..offset].to_vec();
     let mut chained_reader = AsyncReadExt::chain(Cursor::new(remaining), client_reader);
 
-    info!("income connection auth success");
     response_to_client(&mut client_writer, &Response::Success).await?;
 
     match cmd {
         // === TCP 模式 ===
         Command::TcpConnect => {
             let target = TcpStream::connect((addr.addr(), addr.port())).await?;
+            info!("Tcp connect to {}", addr);
             let (mut target_r, mut target_w) = target.into_split();
 
             // 创建停机信号
@@ -371,7 +371,7 @@ async fn handle_client(
                             {
                                 limiter.until_n_ready(nz).await.ok();
                             };
-
+                            info!("Udp connect to {}", addr);
                             if let Err(e) = sock_send
                                 .send_to(&payload, (addr.addr(), addr.port()))
                                 .await

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::ValueEnum;
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::f64::consts::PI;
