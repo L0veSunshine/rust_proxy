@@ -20,3 +20,9 @@ target/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 .idea/
 .vscode/
+
+# Configuration and runtime files
+config.toml
+*.pem
+*.db
+*.log

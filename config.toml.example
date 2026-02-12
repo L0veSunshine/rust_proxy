@@ -1,0 +1,37 @@
+# Rust Proxy 服务端配置文件示例
+# 复制此文件为 config.toml 并根据实际情况修改
+
+# ===== 网络配置 =====
+
+# 服务端监听端口（用于客户端连接）
+port = 8443
+
+# API 管理端口（用于用户管理和统计查询）
+api_port = 1081
+
+# ===== TLS 证书配置 =====
+
+# TLS 证书路径
+# 可以使用以下命令生成自签名证书：
+# openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem \
+#   -days 365 -nodes -subj "/CN=localhost"
+cert_path = "cert.pem"
+key_path = "key.pem"
+
+# ===== 数据库配置 =====
+
+# 用户数据库路径（使用 redb 嵌入式数据库）
+users_db = "users.db"
+
+# ===== 日志配置 =====
+
+# 日志级别: trace, debug, info, warn, error
+log_level = "info"
+
+# 日志文件名前缀
+# 实际文件名格式: <log_name>_YYYY-MM-DD_HH.log
+log_name = "server"
+
+# 日志轮转大小（字节）
+# 默认 10MB = 10 * 1024 * 1024 = 10485760
+log_max_size = 10485760
