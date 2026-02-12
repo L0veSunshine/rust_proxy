@@ -355,6 +355,7 @@ async fn handle_socks5_proxy(
             let shutdown_main = shutdown.clone();
 
             let udp_recv = udp.clone();
+            let client_src_clone = client_src.clone();
             // --- 任务 A: 接收本地 UDP 数据 -> 写入 TLS ---
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65535];
@@ -363,7 +364,8 @@ async fn handle_socks5_proxy(
                         _ = shutdown_udp_listener.notified() => break,
                         res = udp_recv.recv_from(&mut buf) => res,
                     };
-                    if let Ok((n, _)) = result {
+                    if let Ok((n, src_addr)) = result {
+                        *client_src_clone.lock().await = Some(src_addr);
                         if n == 0 {
                             break;
                         }
