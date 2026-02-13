@@ -1,5 +1,7 @@
 use crate::api::common::ServerStatistic;
 use crate::config::ServerConfig;
+use crate::connection_pool::ConnectionPool;
+use crate::health::SystemMetrics;
 use crate::protocol::fallback::{handle_tcp_fallback, handle_tls_fallback};
 use crate::protocol::message::{
     Command, Response, build_udp_frame, read_client_request, read_udp_frame, response_to_client,
@@ -8,6 +10,7 @@ use crate::protocol::net_addr::NetAddr;
 use crate::protocol::utils::{NATType, bind_dual_stack_udp, get_canonical_ip};
 use crate::secret::tls;
 use crate::secret::totp::get_user_profile;
+use crate::shutdown::{ConnectionGuard, GracefulShutdown};
 use crate::user_manager::UserManager;
 use anyhow::Result;
 use bytes::BytesMut;
@@ -23,7 +26,7 @@ use tokio::select;
 use tokio::sync::Notify;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 enum HandShakeStatus {
@@ -34,13 +37,16 @@ enum HandShakeStatus {
 
 pub const UDP_BUFFER_SIZE: usize = 65535;
 pub async fn run(
-    config: ServerConfig,
-    keys: Arc<UserManager>,
+    configs: ServerConfig,
+    manager: Arc<UserManager>,
     stat_map: Arc<ServerStatistic>,
+    metrics: Arc<SystemMetrics>,
+    connection_pool: ConnectionPool,
+    shutdown: GracefulShutdown,
 ) -> Result<()> {
     let acceptor = Arc::new(tls::create_server_config(
-        &config.cert_path,
-        &config.key_path,
+        &configs.cert_path,
+        &configs.key_path,
     )?);
     // 1. 创建 IPv6 Socket
     let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
@@ -52,7 +58,7 @@ pub async fn run(
     // 4. 设置为非阻塞，适配 Tokio
     socket.set_nonblocking(true)?;
     // 5. 绑定到 [::]:port (同时覆盖 IPv4 和 IPv6)
-    let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, config.port));
+    let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, configs.port));
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
     let listener = TcpListener::from_std(socket.into())?;
@@ -60,17 +66,60 @@ pub async fn run(
         .with_time(Duration::from_secs(60)) // 空闲60秒后开始探测
         .with_interval(Duration::from_secs(10)) // 探测失败后每10秒重试
         .with_retries(3); // 重试3次失败则断开
-    println!("Server listening on [::]:{}", config.port);
+
+    println!("Server listening on [::]:{}", configs.port);
+    println!("Max connections: {}", connection_pool.max_connections());
 
     loop {
-        let (socket, _) = listener.accept().await?;
+        // 检查是否正在关闭
+        if shutdown.is_shutting_down() {
+            info!("Server is shutting down, stopping accept loop");
+            break;
+        }
+
+        // 等待新连接或关闭信号
+        let accept_result = select! {
+            result = listener.accept() => result,
+            _ = shutdown.wait_shutdown() => {
+                info!("Received shutdown signal in accept loop");
+                break;
+            }
+        };
+
+        let (socket, _) = match accept_result {
+            Ok(conn) => conn,
+            Err(e) => {
+                error!("Failed to accept connection: {}", e);
+                continue;
+            }
+        };
+
+        // 尝试获取连接许可
+        let conn_permit = match connection_pool.acquire().await {
+            Ok(permit) => permit,
+            Err(e) => {
+                warn!("Connection pool full, rejecting connection: {}", e);
+                continue;
+            }
+        };
+
+        // 跟踪连接（RAII 自动清理）
+        let conn_guard = ConnectionGuard::new(shutdown.clone());
+        metrics.increment_connection();
+
         let native_socket = SockRef::from(&socket);
         native_socket.set_tcp_nodelay(true)?;
         native_socket.set_tcp_keepalive(&ka)?;
         let acceptor = acceptor.clone();
-        let user_manager_cloned = keys.clone();
+        let user_manager_cloned = manager.clone();
         let stat_map_cloned = stat_map.clone();
+        let metrics_cloned = metrics.clone();
+
         tokio::spawn(async move {
+            // 保持连接许可和连接守卫生命周期
+            let _permit = conn_permit;
+            let _guard = conn_guard;
+
             if let Err(e) = handle_client(
                 socket,
                 acceptor,
@@ -82,8 +131,14 @@ pub async fn run(
             {
                 error!("Server Error: {}", e);
             }
+
+            // 连接结束，减少活跃连接数
+            metrics_cloned.decrement_connection();
         });
     }
+
+    info!("Server accept loop stopped");
+    Ok(())
 }
 
 async fn handle_client(

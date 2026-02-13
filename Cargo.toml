@@ -32,6 +32,7 @@ http = "1.4.0"
 redb = "3.1.0"
 hex = "0.4.3"
 governor = "0.10.4"
+sysinfo = "0.38.1"
 
 [profile.release]
 strip = true      # 强制剔除符号（缩小 GNU 体积的关键）
