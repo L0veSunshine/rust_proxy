@@ -68,8 +68,6 @@ pub struct ReadyCheck {
 }
 
 /// 健康检查处理器
-
-// 建议将 System 对象也封装进 State，或者在函数内部只初始化必要的部分
 pub async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     // 1. 系统级别的刷新配置：明确传入 MemoryRefreshKind::everything()
     let mut sys = System::new_with_specifics(
