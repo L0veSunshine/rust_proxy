@@ -19,7 +19,7 @@ impl ConnectionPool {
     pub fn new(max_connections: usize) -> Self {
         // 如果是0，使用一个很大的数字作为无限制
         let limit = if max_connections == 0 {
-            usize::MAX
+            Semaphore::MAX_PERMITS
         } else {
             max_connections
         };
