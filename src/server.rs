@@ -95,7 +95,7 @@ pub async fn run(
         };
 
         // 尝试获取连接许可
-        let conn_permit = match connection_pool.acquire().await {
+        let conn_permit = match connection_pool.try_acquire() {
             Ok(permit) => permit,
             Err(e) => {
                 warn!("Connection pool full, rejecting connection: {}", e);

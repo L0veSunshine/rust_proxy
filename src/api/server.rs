@@ -3,12 +3,12 @@ use crate::health::{SystemMetrics, health_check, ready_check};
 use crate::user_manager::ServiceError::RequestParamError;
 use crate::user_manager::{ServiceError, ServiceResult, UserManager};
 use anyhow::Result;
-use axum::routing::delete;
+
 use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
-    routing::{get, post, put},
+    routing::{get, put},
 };
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
@@ -155,10 +155,8 @@ pub async fn start_admin_api(
 
     let app = Router::new()
         // 用户管理
-        .route("/users", get(list_all_user_profile))
-        .route("/users", post(add_user))
-        .route("/users/{id}", put(handle_modify_user))
-        .route("/users/{id}", delete(delete_user))
+        .route("/users", get(list_all_user_profile).post(add_user))
+        .route("/users/{id}", put(handle_modify_user).delete(delete_user))
         // 统计信息
         .route("/stats", get(handle_list_online_users))
         // 健康检查

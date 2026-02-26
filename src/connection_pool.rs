@@ -38,6 +38,12 @@ impl ConnectionPool {
         Ok(ConnectionGuard { _permit: permit })
     }
 
+    /// 尝试获取连接许可 (非阻塞)
+    pub fn try_acquire(&self) -> Result<ConnectionGuard> {
+        let permit = self.semaphore.clone().try_acquire_owned()?;
+        Ok(ConnectionGuard { _permit: permit })
+    }
+
     /// 获取当前可用连接数
     pub fn available(&self) -> usize {
         self.semaphore.available_permits()
