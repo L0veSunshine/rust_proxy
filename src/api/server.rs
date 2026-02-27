@@ -1,12 +1,14 @@
 use crate::api::common::ServerStatistic;
+use crate::health::{SystemMetrics, health_check, ready_check};
 use crate::user_manager::ServiceError::RequestParamError;
 use crate::user_manager::{ServiceError, ServiceResult, UserManager};
 use anyhow::Result;
+
 use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
-    routing::{get, post, put},
+    routing::{get, put},
 };
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
@@ -16,6 +18,7 @@ use uuid::Uuid;
 pub struct AppState {
     pub manager: Arc<UserManager>,
     pub stats: Arc<ServerStatistic>,
+    pub metrics: Arc<SystemMetrics>,
 }
 
 #[derive(Deserialize)]
@@ -138,26 +141,31 @@ async fn handle_list_online_users(State(state): State<Arc<AppState>>) -> Json<Ve
     Json(result)
 }
 
-pub async fn start_api_server(
-    port: u16,
-    stats: Arc<ServerStatistic>,
+pub async fn start_admin_api(
+    listen: &str,
     manager: Arc<UserManager>,
+    stats: Arc<ServerStatistic>,
+    metrics: Arc<SystemMetrics>,
 ) -> Result<()> {
-    let state = Arc::new(AppState { manager, stats });
+    let state = Arc::new(AppState {
+        manager,
+        stats,
+        metrics: metrics.clone(),
+    });
+
     let app = Router::new()
-        .route("/status", get(handle_list_online_users))
-        .route("/users", get(list_all_user_profile))
-        .route("/user", post(add_user)) // 创建用户
-        .route(
-            "/user/{id}",
-            put(handle_modify_user) // 修改单个
-                .delete(delete_user), // 删除单个
-        )
+        // 用户管理
+        .route("/users", get(list_all_user_profile).post(add_user))
+        .route("/users/{id}", put(handle_modify_user).delete(delete_user))
+        // 统计信息
+        .route("/stats", get(handle_list_online_users))
+        // 健康检查
+        .route("/health", get(health_check))
+        .route("/ready", get(ready_check))
         .with_state(state);
 
-    let addr = format!("127.0.0.1:{}", port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    println!("API server listening on {}", addr);
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    println!("API server listening on {}", listen);
     axum::serve(listener, app).await?;
     Ok(())
 }

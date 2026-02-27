@@ -7,8 +7,14 @@ use serde::{Deserialize, Serialize};
 pub struct ServerConfig {
     pub port: u16,
 
+    #[serde(default = "listen_addr")]
+    pub listen: String,
+
     #[serde(default = "api_port")]
     pub api_port: u16,
+
+    #[serde(default)]
+    pub max_connections: Option<usize>,
 
     #[serde(default = "cert_path")]
     pub cert_path: String,
@@ -47,6 +53,7 @@ macro_rules! default_value {
 }
 
 // === 下面是定义默认值 ===
+default_value!(listen_addr, String, String::from("[::]:0"));
 default_value!(api_port, u16, 1081);
 default_value!(cert_path, String, String::from("cert.pem"));
 default_value!(key_path, String, String::from("key.pem"));

@@ -1,5 +1,6 @@
 use crate::protocol::net_addr::NetAddr;
 use anyhow::{Result, anyhow, bail};
+use http::Uri;
 use std::net::IpAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -12,7 +13,7 @@ pub enum HttpRequest {
 /// 解析 host:port 格式的地址或 URI
 fn parse_target(target: &str, default_port: u16) -> Result<NetAddr> {
     // 1. 提取 host 和 port
-    let (host, port) = if let Ok(uri) = target.parse::<http::Uri>() {
+    let (host, port) = if let Ok(uri) = target.parse::<Uri>() {
         match uri.host() {
             // 情况 A: 成功解析为 URI
             Some(h) => (h.to_string(), uri.port_u16().unwrap_or(default_port)),
