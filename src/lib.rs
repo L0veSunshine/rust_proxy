@@ -2,12 +2,16 @@ use tracing::Level;
 use tracing_appender::non_blocking::WorkerGuard;
 
 pub mod api;
+pub mod buffer_pool;
 pub mod client;
 pub mod config;
+pub mod connection_pool;
+pub mod health;
 pub mod log;
 pub mod protocol;
 pub mod secret;
 pub mod server;
+pub mod shutdown;
 pub mod user_manager;
 
 pub fn init_logger(log_name: &str, level: &str, rotating_size: u64) -> WorkerGuard {

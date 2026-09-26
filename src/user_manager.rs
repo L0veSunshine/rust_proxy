@@ -235,10 +235,10 @@ impl UserManager {
     pub fn get_user(&self, key_id: [u8; 4]) -> ServiceResult<UserProfile> {
         self.cache
             .get(&key_id)
-            .map(|kv| UserProfile {
+            .map(|user| UserProfile {
                 secret: key_id.to_vec(),
-                max_ip: kv.max_ip,
-                rate_limit: kv.rate_limit,
+                max_ip: user.max_ip,
+                rate_limit: user.rate_limit,
             })
             .ok_or_else(|| ServiceError::UserNotFound(hex::encode(key_id)))
     }
