@@ -48,17 +48,25 @@ pub async fn run(
         &configs.cert_path,
         &configs.key_path,
     )?);
-    // 1. 创建 IPv6 Socket
-    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
-    // 2. 关闭 IPV6_V6ONLY，允许 IPv4 映射到这个 IPv6 Socket
-    // 这样绑定 [::] 也就同时绑定了 0.0.0.0
-    socket.set_only_v6(false)?;
+    // 1. 获取解析后的监听地址并适配 IPv4 / IPv6 协议族
+    let addr = configs.listen_addr()?;
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+
+    // 2. 如果是 IPv6 且为 [::]，关闭 IPV6_V6ONLY 允许 IPv4 映射实现双栈监听
+    if addr.is_ipv6() && addr.ip() == std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED) {
+        let _ = socket.set_only_v6(false);
+    }
+
     // 3. 设置端口复用 (防止重启报错)
     socket.set_reuse_address(true)?;
     // 4. 设置为非阻塞，适配 Tokio
     socket.set_nonblocking(true)?;
-    // 5. 绑定到 [::]:port (同时覆盖 IPv4 和 IPv6)
-    let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, configs.port));
+    // 5. 绑定到指定地址
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
     let listener = TcpListener::from_std(socket.into())?;
@@ -67,7 +75,7 @@ pub async fn run(
         .with_interval(Duration::from_secs(10)) // 探测失败后每10秒重试
         .with_retries(3); // 重试3次失败则断开
 
-    println!("Server listening on [::]:{}", configs.port);
+    println!("Server listening on {}", addr);
     println!("Max connections: {}", connection_pool.max_connections());
 
     loop {
