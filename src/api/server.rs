@@ -4,6 +4,7 @@ use crate::user_manager::ServiceError::RequestParamError;
 use crate::user_manager::{ServiceError, ServiceResult, UserManager};
 use anyhow::Result;
 
+use crate::shutdown::GracefulShutdown;
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -12,7 +13,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
-use crate::shutdown::GracefulShutdown;
 use std::sync::Arc;
 use uuid::Uuid;
 

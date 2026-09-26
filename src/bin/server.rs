@@ -109,11 +109,10 @@ fn is_process_alive(pid: u32) -> bool {
 fn spawn_daemon(config_path: &str, pid_file: &str) -> Result<()> {
     if let Some(existing_pid) = read_pid(pid_file) {
         if is_process_alive(existing_pid) {
+            eprintln!("[-] 错误: 服务已在后台运行中 (PID: {})。", existing_pid);
             eprintln!(
-                "[-] 错误: 服务已在后台运行中 (PID: {})。",
-                existing_pid
+                "    提示: 可使用 './server status' 查看，或 './server stop' / './server restart'。"
             );
-            eprintln!("    提示: 可使用 './server status' 查看，或 './server stop' / './server restart'。");
             std::process::exit(1);
         } else {
             println!(
