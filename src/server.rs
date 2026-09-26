@@ -99,6 +99,8 @@ pub async fn run(
             Ok(permit) => permit,
             Err(e) => {
                 warn!("Connection pool full, rejecting connection: {}", e);
+                // 设置 linger(0)，在丢弃时发送 RST 立即终止连接，防止高并发下服务端堆积大量 TIME_WAIT 套接字
+                let _ = SockRef::from(&socket).set_linger(Some(Duration::ZERO));
                 continue;
             }
         };
