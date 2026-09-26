@@ -118,7 +118,11 @@ impl Drop for ConnectionGuard {
 }
 
 /// 设置信号处理器（Unix: SIGTERM, SIGINT; Windows: Ctrl+C）
-pub async fn setup_signal_handler(shutdown: GracefulShutdown) {
+///
+/// # Arguments
+/// * `shutdown` - 优雅关闭控制器
+/// * `is_daemon` - 是否为后台模式。为 true 时忽略 Ctrl+C (SIGINT)，仅响应 SIGTERM 或管理命令
+pub async fn setup_signal_handler(shutdown: GracefulShutdown, is_daemon: bool) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -126,22 +130,83 @@ pub async fn setup_signal_handler(shutdown: GracefulShutdown) {
         let mut sigterm = signal(SignalKind::terminate()).expect("failed to setup SIGTERM handler");
         let mut sigint = signal(SignalKind::interrupt()).expect("failed to setup SIGINT handler");
 
-        tokio::select! {
-            _ = sigterm.recv() => {
-                info!("Received SIGTERM");
+        if is_daemon {
+            loop {
+                tokio::select! {
+                    _ = sigterm.recv() => {
+                        info!("Received SIGTERM, initiating graceful shutdown");
+                        break;
+                    }
+                    _ = sigint.recv() => {
+                        info!("Ignored SIGINT (Ctrl+C) in daemon mode");
+                    }
+                }
             }
-            _ = sigint.recv() => {
-                info!("Received SIGINT");
+        } else {
+            tokio::select! {
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM, initiating graceful shutdown");
+                }
+                _ = sigint.recv() => {
+                    info!("Received SIGINT (Ctrl+C), initiating graceful shutdown");
+                }
             }
         }
     }
 
     #[cfg(windows)]
     {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to setup Ctrl+C handler");
-        info!("Received Ctrl+C");
+        if is_daemon {
+            let mut ctrl_c = tokio::signal::windows::ctrl_c().ok();
+            let mut ctrl_break = tokio::signal::windows::ctrl_break().ok();
+            let mut ctrl_close = tokio::signal::windows::ctrl_close().ok();
+            let mut ctrl_shutdown = tokio::signal::windows::ctrl_shutdown().ok();
+
+            loop {
+                tokio::select! {
+                    Some(_) = async {
+                        match &mut ctrl_break {
+                            Some(b) => b.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        info!("Received Ctrl+Break, initiating graceful shutdown");
+                        break;
+                    }
+                    Some(_) = async {
+                        match &mut ctrl_close {
+                            Some(c) => c.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        info!("Received Ctrl+Close, initiating graceful shutdown");
+                        break;
+                    }
+                    Some(_) = async {
+                        match &mut ctrl_shutdown {
+                            Some(s) => s.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        info!("Received Ctrl+Shutdown, initiating graceful shutdown");
+                        break;
+                    }
+                    Some(_) = async {
+                        match &mut ctrl_c {
+                            Some(c) => c.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        info!("Ignored Ctrl+C in daemon mode");
+                    }
+                }
+            }
+        } else {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to setup Ctrl+C handler");
+            info!("Received Ctrl+C, initiating graceful shutdown");
+        }
     }
 
     shutdown.trigger_shutdown();

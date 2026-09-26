@@ -12,6 +12,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
+use crate::shutdown::GracefulShutdown;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -19,6 +20,7 @@ pub struct AppState {
     pub manager: Arc<UserManager>,
     pub stats: Arc<ServerStatistic>,
     pub metrics: Arc<SystemMetrics>,
+    pub shutdown: GracefulShutdown,
 }
 
 #[derive(Deserialize)]
@@ -141,16 +143,30 @@ async fn handle_list_online_users(State(state): State<Arc<AppState>>) -> Json<Ve
     Json(result)
 }
 
+async fn handle_shutdown(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let shutdown = state.shutdown.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        shutdown.trigger_shutdown();
+    });
+    Json(serde_json::json!({
+        "status": "ok",
+        "message": "Shutting down gracefully"
+    }))
+}
+
 pub async fn start_admin_api(
     listen: &str,
     manager: Arc<UserManager>,
     stats: Arc<ServerStatistic>,
     metrics: Arc<SystemMetrics>,
+    shutdown: GracefulShutdown,
 ) -> Result<()> {
     let state = Arc::new(AppState {
         manager,
         stats,
         metrics: metrics.clone(),
+        shutdown,
     });
 
     let app = Router::new()
@@ -162,6 +178,8 @@ pub async fn start_admin_api(
         // 健康检查
         .route("/health", get(health_check))
         .route("/ready", get(ready_check))
+        // 优雅关闭
+        .route("/shutdown", axum::routing::post(handle_shutdown))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
