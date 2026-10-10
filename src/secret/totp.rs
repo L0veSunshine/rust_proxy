@@ -119,9 +119,13 @@ fn match_totp_window(secret: &[u8], token: &Uuid) -> Option<u64> {
 
     let current = now_secs() / TIME_STEP;
     // 依次检查：当前窗、上一窗(容忍迟到)、下一窗(容忍时钟超前)
-    [current, current.saturating_sub(1), current.saturating_add(1)]
-        .into_iter()
-        .find(|&counter| *token == generate_uuid_at_counter(secret, &key_id, &nonce, counter))
+    [
+        current,
+        current.saturating_sub(1),
+        current.saturating_add(1),
+    ]
+    .into_iter()
+    .find(|&counter| *token == generate_uuid_at_counter(secret, &key_id, &nonce, counter))
 }
 
 fn generate_uuid_at_counter(
