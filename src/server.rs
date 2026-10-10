@@ -9,7 +9,7 @@ use crate::protocol::message::{
 use crate::protocol::net_addr::NetAddr;
 use crate::protocol::utils::{NATType, bind_dual_stack_udp, get_canonical_ip};
 use crate::secret::tls;
-use crate::secret::totp::get_user_profile;
+use crate::secret::totp::{consume_token, token_fingerprint, verify_user_token};
 use crate::shutdown::{ConnectionGuard, GracefulShutdown};
 use crate::user_manager::UserManager;
 use anyhow::Result;
@@ -230,13 +230,26 @@ async fn handle_client(
 
     let key_sig: [u8; 4] = uuid.as_bytes()[12..16].try_into().unwrap_or_default();
 
-    let user_profile = match get_user_profile(manager.clone(), &uuid) {
-        Some(p) => p,
+    // 1. 先做密码学校验(此时还不消费 token)
+    let verified = match verify_user_token(&manager, &uuid) {
+        Some(v) => v,
         None => return handle_tls_fallback(&peek[..offset], client_reader, client_writer).await,
     };
 
+    // 2. 所有前置检查(IP 限制等)通过后，才真正消费 token，
+    //    避免后续步骤失败时把这次 token 白白烧掉。
     let _guard = manager.enter_ip(key_sig, get_canonical_ip(peer_ip))?;
-    let limiter = manager.get_user_limiter(key_sig, user_profile.rate_limit);
+    if !consume_token(&uuid, verified.expire_at) {
+        // 不打印原始 token，避免日志泄露可用于重放的凭证
+        warn!(
+            "Replay Attack Detected (user {:x?}, token fp {})",
+            key_sig,
+            token_fingerprint(&uuid)
+        );
+        return handle_tls_fallback(&peek[..offset], client_reader, client_writer).await;
+    }
+
+    let limiter = manager.get_user_limiter(key_sig, verified.profile.rate_limit);
     let limiter_upload = limiter.clone();
 
     let stat_map_upload = stat_map.clone();
