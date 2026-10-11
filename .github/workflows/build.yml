@@ -144,8 +144,27 @@ jobs:
       - name: Prepare binaries for release
         run: |
           mkdir -p release-binaries
-          # Move files out of the artifact subdirectories
-          find ./artifacts -type f -exec mv {} release-binaries/ \;
+          # 每个 artifact 解压到 ./artifacts/<artifact-name>/，
+          # 直接汇总会因各平台同名(如 client/server)而互相覆盖，
+          # 因此这里带上平台后缀重命名。
+          for dir in ./artifacts/*/; do
+            platform="${dir##*rust_proxy_}"
+            platform="${platform%/}"
+            for file in "$dir"client "$dir"client.exe "$dir"server "$dir"server.exe; do
+              [ -f "$file" ] || continue
+              name="$(basename "$file")"
+              ext=""
+              case "$name" in
+                *.exe)
+                  name="${name%.exe}"
+                  ext=".exe"
+                  ;;
+              esac
+              cp "$file" "release-binaries/${name}_${platform}${ext}"
+            done
+          done
+          echo "Release binaries:"
+          ls -l release-binaries
 
       - name: Release
         uses: softprops/action-gh-release@v2

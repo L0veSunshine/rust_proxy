@@ -1,8 +1,10 @@
 use tracing::Level;
 use tracing_appender::non_blocking::WorkerGuard;
 
+/// 双向转发使用的缓冲区大小
+pub const RELAY_BUFFER_SIZE: usize = 8192;
+
 pub mod api;
-pub mod buffer_pool;
 pub mod client;
 pub mod config;
 pub mod connection_pool;

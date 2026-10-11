@@ -1,3 +1,4 @@
+use crate::RELAY_BUFFER_SIZE;
 use crate::api::common::ServerStatistic;
 use crate::config::ServerConfig;
 use crate::connection_pool::ConnectionPool;
@@ -276,14 +277,20 @@ async fn handle_client(
 
             // 目标 -> 代理 -> 客户端
             tokio::spawn(async move {
-                let mut target_to_client_buf = vec![0u8; 8192];
+                let mut target_to_client_buf = BytesMut::with_capacity(RELAY_BUFFER_SIZE);
+                let mut graceful_eof = false;
                 loop {
+                    // 复位 len 让 read_buf 能用满整块容量；只清长度，不清零数据
+                    target_to_client_buf.clear();
                     let n = select! {
                         _ = shutdown_tcp_rx_remote.notified() => break,
-                        n = target_r.read(&mut target_to_client_buf) => n
+                        n = target_r.read_buf(&mut target_to_client_buf) => n
                     };
                     let length = match n {
-                        Ok(0) => break,
+                        Ok(0) => {
+                            graceful_eof = true;
+                            break;
+                        }
                         Ok(n) => n,
                         Err(e) => {
                             error!("read form target error: {}", e);
@@ -305,20 +312,38 @@ async fn handle_client(
                         error!("Target write to client error {}", e);
                         break;
                     }
+                    // tokio-rustls 的 write_all 只保证数据进入 rustls 的发送缓冲，
+                    // 不 flush 就可能一直滞留对端收不到、同时失去背压：目标侧读阻塞后
+                    // 这个循环再也不会 poll 写入端，尾部数据永远发不出去，大响应会中途卡死。
+                    if let Err(e) = client_writer.flush().await {
+                        error!("Target flush to client error {}", e);
+                        break;
+                    }
                     stat_map_download.update_download(key_sig, length);
                 }
-                shutdown_tcp_tx_remote.notify_waiters();
+                // 目标侧 EOF 表示响应正常结束：只把半关闭传递出去（关闭对客户端的写端，
+                // 让对端看到 EOF），不连带掐断另一方向；只有出错时才连带拆除隧道。
+                if !graceful_eof {
+                    shutdown_tcp_tx_remote.notify_waiters();
+                }
+                let _ = client_writer.shutdown().await;
             });
 
             // 客户端 -> 代理 -> 目标
-            let mut client_to_target_buf = vec![0u8; 8192];
+            let mut client_to_target_buf = BytesMut::with_capacity(RELAY_BUFFER_SIZE);
+            let mut graceful_eof = false;
             loop {
+                // 复位 len 让 read_buf 能用满整块容量；只清长度，不清零数据
+                client_to_target_buf.clear();
                 let n = select! {
                     _ = shutdown_tcp_rx_local.notified() => break,
-                    n = chained_reader.read(&mut client_to_target_buf) => n
+                    n = chained_reader.read_buf(&mut client_to_target_buf) => n
                 };
                 let length = match n {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        graceful_eof = true;
+                        break;
+                    }
                     Ok(n) => n,
                     Err(e) => {
                         error!("Read from client error {}", e);
@@ -337,7 +362,12 @@ async fn handle_client(
                 }
                 stat_map_upload.update_upload(key_sig, length);
             }
-            shutdown_tcp_tx_local.notify_waiters()
+            // 客户端侧 EOF：把半关闭传给目标（很多目标要靠这个 FIN 才回包），
+            // 不连带掐断下载方向；只有出错时才拆除整条隧道。
+            if !graceful_eof {
+                shutdown_tcp_tx_local.notify_waiters();
+            }
+            let _ = target_w.shutdown().await;
         }
 
         // === UDP 模式 (Full Cone) ===
