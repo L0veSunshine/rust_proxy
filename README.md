@@ -87,11 +87,17 @@ cargo build --release
 ### 5️⃣ 启动服务端
 
 ```bash
-# 使用开发版本
-./target/debug/server
-
-# 使用生产版本
+# 前台运行（按 Ctrl+C 优雅退出）
 ./target/release/server
+
+# 后台运行（脱离终端，按 Ctrl+C 不会退出）
+./target/release/server -d
+
+# 查看后台运行状态
+./target/release/server status
+
+# 停止后台服务
+./target/release/server stop
 ```
 
 ### 6️⃣ 创建用户
@@ -241,7 +247,38 @@ GET http://localhost:1081/stats
 
 ### 服务端命令行参数
 
-服务端使用配置文件，无需命令行参数。
+服务端支持前台/后台守护进程模式，以及完整的进程管理子命令：
+
+```bash
+server [OPTIONS] [COMMAND]
+
+选项:
+  -c, --config <CONFIG>          配置文件路径 [默认: config.toml]
+  -d, --daemon                   在后台作为守护进程运行 (daemon 模式，脱离终端且 Ctrl+C 不退出)
+      --pid-file <PID_FILE>      PID 文件保存路径 [默认: server.pid]
+  -h, --help                     显示帮助信息
+
+子命令:
+  start [-d/--daemon]            启动服务（加 -d 为后台运行）
+  stop                           优雅停止后台运行的服务
+  status                         查看服务的运行状态与健康统计
+  restart [-d/--daemon]          重启服务（默认在后台运行）
+
+示例:
+  # 后台启动服务（脱离终端，按 Ctrl+C 不会退出）
+  ./server -d
+  # 或使用子命令
+  ./server start -d
+
+  # 查看服务运行状态（进程 PID、运行时间、活跃连接、内存占用等）
+  ./server status
+
+  # 优雅停止后台服务
+  ./server stop
+
+  # 重启服务
+  ./server restart
+```
 
 ### 客户端命令行参数
 

@@ -1,3 +1,4 @@
+use crate::RELAY_BUFFER_SIZE;
 use crate::api::client::{add_download, add_upload};
 use crate::protocol::http;
 use crate::protocol::message::{
@@ -9,6 +10,7 @@ use crate::protocol::utils::bind_dual_stack_udp;
 use crate::secret::tls;
 use crate::secret::totp::generate_totp_uuid;
 use anyhow::{Result, bail};
+use bytes::BytesMut;
 use rustls::pki_types::ServerName;
 use socket2::{SockRef, TcpKeepalive};
 use std::convert::TryFrom;
@@ -98,13 +100,19 @@ where
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut buf = vec![0u8; 8192];
+        let mut buf = BytesMut::with_capacity(RELAY_BUFFER_SIZE);
+        let mut graceful_eof = false;
         loop {
-            let n = select! {
+            // 复位 len 让 read_buf 能用满整块容量；只清长度，不清零数据
+            buf.clear();
+            let n: usize = select! {
                 _ = shutdown_rx.notified() => 0,
-                res = reader.read(&mut buf) => {
+                res = reader.read_buf(&mut buf) => {
                     match res {
-                        Ok(0) => break,
+                        Ok(0) => {
+                            graceful_eof = true;
+                            break;
+                        }
                         Ok(n) => n,
                         Err(e) => {
                             error!("Client read from {} error: {}", direction, e);
@@ -120,9 +128,19 @@ where
                 error!("Client write to {} error: {}", direction, e);
                 break;
             }
+            // 写入端可能是 TLS(上行方向)：write_all 不保证刷出，必须显式 flush
+            if let Err(e) = writer.flush().await {
+                error!("Client flush to {} error: {}", direction, e);
+                break;
+            }
             add_metrics(n);
         }
-        shutdown_tx.notify_waiters();
+        // 读端 EOF 只是本方向结束(半关闭)：把 FIN 传给对端即可，不能掐断另一方向，
+        // 否则"请求发完就半关闭"的客户端（以及要靠 FIN 才回包的目标）拿不到响应。
+        // 只有出错或对端要求停止时才连带拆除整条隧道。
+        if !graceful_eof {
+            shutdown_tx.notify_waiters();
+        }
         let _ = writer.shutdown().await;
     })
 }
@@ -217,6 +235,9 @@ async fn handle_http_proxy(
                 );
                 return Err(anyhow::anyhow!("Failed to write initial data"));
             }
+            // HTTP 路径的请求不经过 relay，必须在这里刷出去；否则后续 relay
+            // 不会再写这个 TLS 写入端，请求会滞留在 rustls 发送缓冲里
+            tls_w.flush().await?;
 
             let (local_r, local_w) = local.into_split();
 

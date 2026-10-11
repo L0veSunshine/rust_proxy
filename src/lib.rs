@@ -1,13 +1,19 @@
 use tracing::Level;
 use tracing_appender::non_blocking::WorkerGuard;
 
+/// 双向转发使用的缓冲区大小
+pub const RELAY_BUFFER_SIZE: usize = 8192;
+
 pub mod api;
 pub mod client;
 pub mod config;
+pub mod connection_pool;
+pub mod health;
 pub mod log;
 pub mod protocol;
 pub mod secret;
 pub mod server;
+pub mod shutdown;
 pub mod user_manager;
 
 pub fn init_logger(log_name: &str, level: &str, rotating_size: u64) -> WorkerGuard {
