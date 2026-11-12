@@ -4,7 +4,7 @@ use axum::extract::State;
 use serde::Serialize;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use sysinfo::{MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
@@ -12,27 +12,22 @@ use sysinfo::{MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshK
 static START_TIME: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 /// 全局系统信息（共享状态）
+///
+/// 活跃连接数统一由 [`crate::shutdown::GracefulShutdown`] 的 RAII 守卫维护，这里只记累计值。
 #[derive(Clone)]
 pub struct SystemMetrics {
-    pub active_connections: Arc<AtomicUsize>,
     pub total_connections: Arc<AtomicU64>,
 }
 
 impl SystemMetrics {
     pub fn new() -> Self {
         Self {
-            active_connections: Arc::new(AtomicUsize::new(0)),
             total_connections: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    pub fn increment_connection(&self) {
-        self.active_connections.fetch_add(1, Ordering::Relaxed);
+    pub fn record_connection(&self) {
         self.total_connections.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn decrement_connection(&self) {
-        self.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -86,7 +81,7 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> Json<HealthResp
     );
 
     let uptime = START_TIME.elapsed().as_secs();
-    let active = state.metrics.active_connections.load(Ordering::Relaxed);
+    let active = state.shutdown.active_connections();
     let total = state.metrics.total_connections.load(Ordering::Relaxed);
 
     let memory_mb = sys

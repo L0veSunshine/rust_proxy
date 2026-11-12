@@ -1,4 +1,3 @@
-use crate::protocol::message::parse_addr;
 use crate::protocol::net_addr::NetAddr;
 use anyhow::{Result, bail};
 use std::io::{Error, ErrorKind};
@@ -73,30 +72,30 @@ pub fn parse_udp_packet(data: &[u8]) -> std::io::Result<(NetAddr, usize)> {
         ));
     }
 
-    // UDP 头部前 3 个字节是 RSV, RSV, FRAG
-    // 剩下的从 index 3 开始 (ATYP 位置) 正好就是一个标准的地址格式
-    // 直接复用 parse_addr 解析剩余部分
-    let (addr, len) = parse_addr(&data[3..])?;
+    // 从 index 3 (ATYP 位置) 开始正好是一个标准的地址格式
+    let (addr, len) = NetAddr::parse(&data[3..])?;
 
-    // 总消耗长度 = 头部偏移(3) + parse_addr 消耗长度
+    // 总消耗长度 = 头部偏移(3) + 地址长度
     Ok((addr, len + 3))
 }
 
-/// 构建 SOCKS5 UDP 数据包 (用于回复客户端)
+/// 把 SOCKS5 UDP 数据包追加编码到 `buf` (用于回复客户端)
 /// 格式: RSV(2) | FRAG(1) | ATYP(1) | ADDR | PORT | DATA
-pub fn build_udp_packet(target_addr: &NetAddr, data: &[u8]) -> std::io::Result<Vec<u8>> {
-    // 预估头部最大长度 (IPv6 16+1+2=19, Domain 255+1+1+2=259) + 数据长度
-    let mut buf = Vec::with_capacity(300 + data.len());
-
-    // RSV
-    buf.extend_from_slice(&[0x00, 0x00]);
-    // FRAG
-    buf.push(0x00);
-
-    let addr_bytes: Vec<u8> = target_addr.into();
-    buf.extend_from_slice(addr_bytes.as_slice());
-
-    // Append Payload
+pub fn encode_udp_packet(
+    target_addr: &NetAddr,
+    data: &[u8],
+    buf: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    buf.reserve(3 + target_addr.bytes_len() + data.len());
+    // RSV + FRAG
+    buf.extend_from_slice(&[0x00, 0x00, 0x00]);
+    target_addr.write_to_buf(buf)?;
     buf.extend_from_slice(data);
+    Ok(())
+}
+
+pub fn build_udp_packet(target_addr: &NetAddr, data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    encode_udp_packet(target_addr, data, &mut buf)?;
     Ok(buf)
 }

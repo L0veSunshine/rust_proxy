@@ -1,8 +1,8 @@
 use tracing::Level;
 use tracing_appender::non_blocking::WorkerGuard;
 
-/// 双向转发使用的缓冲区大小
-pub const RELAY_BUFFER_SIZE: usize = 8192;
+/// 双向转发使用的缓冲区大小（TLS 单条记录最大 16KB，取其两倍以减少系统调用）
+pub const RELAY_BUFFER_SIZE: usize = 32 * 1024;
 
 pub mod api;
 pub mod client;
@@ -11,6 +11,7 @@ pub mod connection_pool;
 pub mod health;
 pub mod log;
 pub mod protocol;
+pub mod relay;
 pub mod secret;
 pub mod server;
 pub mod shutdown;

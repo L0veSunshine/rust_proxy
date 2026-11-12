@@ -60,13 +60,22 @@ pub fn bind_dual_stack_udp() -> Result<tokio::net::UdpSocket> {
     Ok(tokio_udp)
 }
 
+/// 把 IPv4 地址转换为 IPv4-mapped IPv6 地址。
+///
+/// 双栈 UDP socket 绑定在 `[::]` 上，部分平台不接受直接向 IPv4 SocketAddr 发送。
+pub fn to_dual_stack(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(v4) => SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port()),
+        v6 => v6,
+    }
+}
+
 /// 生成符合高斯分布（正态分布）的 Padding 长度
 ///
 /// - `mean`: 均值 (期望的 Padding 大小)
 /// - `std_dev`: 标准差 (数据的离散程度，越大越分散)
-///
-/// 返回值会自动限制在 [0, 65536] 之间以适配 PadLen(u16)
-pub fn generate_gaussian_padding(mean: f64, std_dev: f64) -> u16 {
+/// - `min` / `max`: 结果的硬性上下限
+pub fn generate_gaussian_padding(mean: f64, std_dev: f64, min: u16, max: u16) -> u16 {
     let mut rng = rand::rng();
 
     // 1. Box-Muller 变换: 从两个均匀分布生成标准正态分布 N(0, 1)
@@ -83,6 +92,18 @@ pub fn generate_gaussian_padding(mean: f64, std_dev: f64) -> u16 {
     let value = mean + std_dev * z0;
 
     // 3. 限制范围并转为 u16
-    // 你的协议 PadLen 是 u16，所以必须截断在 0-65536
-    value.round().clamp(0.0, u16::MAX as f64) as u16
+    value.round().clamp(min as f64, max as f64) as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_padding_respects_bounds() {
+        for _ in 0..10_000 {
+            let len = generate_gaussian_padding(360.0, 600.0, 16, 600);
+            assert!((16..=600).contains(&len));
+        }
+    }
 }

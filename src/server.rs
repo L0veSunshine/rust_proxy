@@ -1,33 +1,33 @@
-use crate::RELAY_BUFFER_SIZE;
 use crate::api::common::ServerStatistic;
 use crate::config::ServerConfig;
 use crate::connection_pool::ConnectionPool;
 use crate::health::SystemMetrics;
 use crate::protocol::fallback::{handle_tcp_fallback, handle_tls_fallback};
 use crate::protocol::message::{
-    Command, Response, build_udp_frame, read_client_request, read_udp_frame, response_to_client,
+    Command, Response, encode_udp_frame, read_client_request, read_udp_frame, response_to_client,
 };
 use crate::protocol::net_addr::NetAddr;
-use crate::protocol::utils::{NATType, bind_dual_stack_udp, get_canonical_ip};
+use crate::protocol::utils::{NATType, bind_dual_stack_udp, get_canonical_ip, to_dual_stack};
+use crate::relay::{relay_bidirectional, write_and_flush};
 use crate::secret::tls;
 use crate::secret::totp::{consume_token, token_fingerprint, verify_user_token};
 use crate::shutdown::{ConnectionGuard, GracefulShutdown};
-use crate::user_manager::UserManager;
+use crate::user_manager::{UserLimiter, UserManager};
 use anyhow::Result;
-use bytes::BytesMut;
 use moka::future::Cache;
 use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
+use std::collections::HashMap;
 use std::io::Cursor;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
-use tokio::sync::Notify;
-use tokio::time::timeout;
+use tokio::time::timeout_at;
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 enum HandShakeStatus {
@@ -37,6 +37,19 @@ enum HandShakeStatus {
 }
 
 pub const UDP_BUFFER_SIZE: usize = 65535;
+
+/// 从 TCP 建连到读完 Client Hello（含 TLS 握手）的总时限，防御 Slowloris
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Client Hello 的最大长度，超过即视为非本协议流量并回落
+const HANDSHAKE_BUFFER_SIZE: usize = 1024;
+/// RFC 4787：NAT 维护 UDP 映射的超时时间应不少于 2 分钟
+const NAT_MAPPING_IDLE: Duration = Duration::from_secs(120);
+/// UDP 关联内域名解析结果的缓存时间与条目上限
+const UDP_DNS_CACHE_TTL: Duration = Duration::from_secs(60);
+const UDP_DNS_CACHE_MAX: usize = 1024;
+/// accept 出错（如文件描述符耗尽）后的退避时间，避免空转
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
 pub async fn run(
     configs: ServerConfig,
     manager: Arc<UserManager>,
@@ -49,8 +62,26 @@ pub async fn run(
         &configs.cert_path,
         &configs.key_path,
     )?);
-    // 1. 获取解析后的监听地址并适配 IPv4 / IPv6 协议族
     let addr = configs.listen_addr()?;
+    let listener = bind_listener(addr)?;
+
+    println!("Server listening on {}", addr);
+    println!("Max connections: {}", connection_pool.max_connections());
+
+    serve(
+        listener,
+        acceptor,
+        manager,
+        stat_map,
+        metrics,
+        connection_pool,
+        shutdown,
+    )
+    .await
+}
+
+/// 创建监听 socket，并适配 IPv4 / IPv6 协议族
+pub fn bind_listener(addr: SocketAddr) -> Result<TcpListener> {
     let domain = if addr.is_ipv6() {
         Domain::IPV6
     } else {
@@ -58,47 +89,50 @@ pub async fn run(
     };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
 
-    // 2. 如果是 IPv6 且为 [::]，关闭 IPV6_V6ONLY 允许 IPv4 映射实现双栈监听
-    if addr.is_ipv6() && addr.ip() == std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED) {
+    // 如果是 IPv6 且为 [::]，关闭 IPV6_V6ONLY 允许 IPv4 映射实现双栈监听
+    if addr.is_ipv6() && addr.ip() == IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED) {
         let _ = socket.set_only_v6(false);
     }
 
-    // 3. 设置端口复用 (防止重启报错)
+    // 设置端口复用 (防止重启报错)
     socket.set_reuse_address(true)?;
-    // 4. 设置为非阻塞，适配 Tokio
     socket.set_nonblocking(true)?;
-    // 5. 绑定到指定地址
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
-    let listener = TcpListener::from_std(socket.into())?;
+    Ok(TcpListener::from_std(socket.into())?)
+}
+
+/// 在已绑定的监听器上处理连接，直到收到关闭信号
+pub async fn serve(
+    listener: TcpListener,
+    acceptor: Arc<TlsAcceptor>,
+    manager: Arc<UserManager>,
+    stat_map: Arc<ServerStatistic>,
+    metrics: Arc<SystemMetrics>,
+    connection_pool: ConnectionPool,
+    shutdown: GracefulShutdown,
+) -> Result<()> {
     let ka = TcpKeepalive::new()
         .with_time(Duration::from_secs(60)) // 空闲60秒后开始探测
         .with_interval(Duration::from_secs(10)) // 探测失败后每10秒重试
         .with_retries(3); // 重试3次失败则断开
 
-    println!("Server listening on {}", addr);
-    println!("Max connections: {}", connection_pool.max_connections());
-
     loop {
-        // 检查是否正在关闭
-        if shutdown.is_shutting_down() {
-            info!("Server is shutting down, stopping accept loop");
-            break;
-        }
-
-        // 等待新连接或关闭信号
+        // 等待新连接或关闭信号（CancellationToken 触发后状态保持，不会漏掉信号）
         let accept_result = select! {
-            result = listener.accept() => result,
+            biased;
             _ = shutdown.wait_shutdown() => {
                 info!("Received shutdown signal in accept loop");
                 break;
             }
+            result = listener.accept() => result,
         };
 
-        let (socket, _) = match accept_result {
+        let (socket, peer) = match accept_result {
             Ok(conn) => conn,
             Err(e) => {
                 error!("Failed to accept connection: {}", e);
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                 continue;
             }
         };
@@ -114,37 +148,46 @@ pub async fn run(
             }
         };
 
+        // 单个 socket 设置失败只影响这条连接，不能让整个服务退出
+        let sock_opts = {
+            let native_socket = SockRef::from(&socket);
+            native_socket
+                .set_tcp_nodelay(true)
+                .and_then(|_| native_socket.set_tcp_keepalive(&ka))
+        };
+        if let Err(e) = sock_opts {
+            warn!("Failed to set socket options for {}: {}", peer, e);
+            continue;
+        }
+
         // 跟踪连接（RAII 自动清理）
         let conn_guard = ConnectionGuard::new(shutdown.clone());
-        metrics.increment_connection();
+        metrics.record_connection();
 
-        let native_socket = SockRef::from(&socket);
-        native_socket.set_tcp_nodelay(true)?;
-        native_socket.set_tcp_keepalive(&ka)?;
         let acceptor = acceptor.clone();
-        let user_manager_cloned = manager.clone();
-        let stat_map_cloned = stat_map.clone();
-        let metrics_cloned = metrics.clone();
+        let manager = manager.clone();
+        let stat_map = stat_map.clone();
+        let conn_cancel = shutdown.connection_token();
 
         tokio::spawn(async move {
-            // 保持连接许可和连接守卫生命周期
+            // 许可与守卫随任务结束一起释放
             let _permit = conn_permit;
             let _guard = conn_guard;
 
-            if let Err(e) = handle_client(
-                socket,
-                acceptor,
-                NATType::FullCone,
-                user_manager_cloned,
-                stat_map_cloned,
-            )
-            .await
-            {
+            // 优雅关闭超时后会取消 conn_cancel，直接丢弃整条连接
+            let result = conn_cancel
+                .run_until_cancelled(handle_client(
+                    socket,
+                    peer.ip(),
+                    &acceptor,
+                    NATType::FullCone,
+                    manager,
+                    &stat_map,
+                ))
+                .await;
+            if let Some(Err(e)) = result {
                 error!("Server Error: {}", e);
             }
-
-            // 连接结束，减少活跃连接数
-            metrics_cloned.decrement_connection();
         });
     }
 
@@ -153,26 +196,35 @@ pub async fn run(
 }
 
 async fn handle_client(
-    mut socket: TcpStream,
-    acceptor: Arc<TlsAcceptor>,
+    socket: TcpStream,
+    peer_ip: IpAddr,
+    acceptor: &TlsAcceptor,
     nat_type: NATType,
     manager: Arc<UserManager>,
-    stat_map: Arc<ServerStatistic>,
+    stat_map: &ServerStatistic,
 ) -> Result<()> {
-    let mut header_byte = [0u8; 1];
-    let n = socket.peek(&mut header_byte).await?;
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
 
-    if n > 0 && header_byte[0] != 0x16 {
+    let mut header_byte = [0u8; 1];
+    let Ok(peeked) = timeout_at(deadline, socket.peek(&mut header_byte)).await else {
+        info!("Handshake timeout before first byte");
+        return Ok(());
+    };
+    if peeked? > 0 && header_byte[0] != 0x16 {
         info!("Non-TLS traffic detected, falling back to TCP proxy");
-        return handle_tcp_fallback(&mut socket).await;
+        return handle_tcp_fallback(socket).await;
     }
 
-    let peer_ip = socket.peer_addr()?.ip();
-    // 建立TLS
-    let stream = acceptor.accept(socket).await?;
-    let (mut client_reader, mut client_writer) = tokio::io::split(stream);
+    // 建立 TLS（同样受握手时限约束）
+    let mut stream = match timeout_at(deadline, acceptor.accept(socket)).await {
+        Ok(stream) => stream?,
+        Err(_) => {
+            info!("TLS handshake timeout");
+            return Ok(());
+        }
+    };
 
-    let mut peek = vec![0u8; 1024];
+    let mut peek = vec![0u8; HANDSHAKE_BUFFER_SIZE];
     let mut offset = 0;
     let handshake_future = async {
         loop {
@@ -180,53 +232,40 @@ async fn handle_client(
                 info!("Handshake buffer full, fallback to web");
                 return Ok(HandShakeStatus::Fallback);
             }
-            let n = client_reader.read(&mut peek[offset..]).await?;
+            let n = stream.read(&mut peek[offset..]).await?;
             if n == 0 {
                 return Ok::<HandShakeStatus, std::io::Error>(HandShakeStatus::Eof); // EOF 连接关闭
             }
             offset += n;
-            let valid_data = &peek[..offset];
-            let mut cursor = Cursor::new(valid_data);
+            let mut cursor = Cursor::new(&peek[..offset]);
             // 读取握手包 (UUID Auth + Padding Skip)
             match read_client_request(&mut cursor).await {
                 Ok((uuid, cmd, addr)) => {
-                    // 解析成功！跳出循环
                     let consumed = cursor.position() as usize;
                     return Ok(HandShakeStatus::Success(uuid, cmd, addr, consumed));
                 }
+                // 数据不够 (UnexpectedEof) 就继续读；其他错误说明协议不对，回落
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => continue,
                 Err(e) => {
-                    // 关键点：如果是数据不够 (UnexpectedEof)，则 continue 继续读
-                    // 如果是其他错误 (InvalidData)，则说明协议不对，回落
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                        // 数据不够，继续下一轮 read
-                        continue;
-                    } else {
-                        info!("Invalid client hello: {}, fallback", e);
-                        return Ok(HandShakeStatus::Fallback);
-                    }
+                    info!("Invalid client hello: {}, fallback", e);
+                    return Ok(HandShakeStatus::Fallback);
                 }
             }
         }
     };
 
-    let handshake_res = timeout(Duration::from_secs(10), handshake_future).await;
-    let (uuid, cmd, addr, consumed_len) = match handshake_res {
-        // 握手超时
+    let (uuid, cmd, addr, consumed_len) = match timeout_at(deadline, handshake_future).await {
+        // 握手超时 (Slowloris protection)
         Err(_) => {
-            // Slowloris protection
             info!("Handshake timeout");
-            // 超时直接断开，或者也可以选择回落
             return Ok(());
         }
         Ok(Err(e)) => return Err(e.into()),
-        Ok(Ok(res)) => match res {
-            // return Ok(())结束本次链接
-            HandShakeStatus::Eof => return Ok(()),
-            HandShakeStatus::Fallback => {
-                return handle_tls_fallback(&peek[..offset], client_reader, client_writer).await;
-            }
-            HandShakeStatus::Success(uuid, cmd, addr, len) => (uuid, cmd, addr, len),
-        },
+        Ok(Ok(HandShakeStatus::Eof)) => return Ok(()),
+        Ok(Ok(HandShakeStatus::Fallback)) => {
+            return handle_tls_fallback(&peek[..offset], stream).await;
+        }
+        Ok(Ok(HandShakeStatus::Success(uuid, cmd, addr, len))) => (uuid, cmd, addr, len),
     };
 
     let key_sig: [u8; 4] = uuid.as_bytes()[12..16].try_into().unwrap_or_default();
@@ -234,12 +273,13 @@ async fn handle_client(
     // 1. 先做密码学校验(此时还不消费 token)
     let verified = match verify_user_token(&manager, &uuid) {
         Some(v) => v,
-        None => return handle_tls_fallback(&peek[..offset], client_reader, client_writer).await,
+        None => return handle_tls_fallback(&peek[..offset], stream).await,
     };
 
     // 2. 所有前置检查(IP 限制等)通过后，才真正消费 token，
     //    避免后续步骤失败时把这次 token 白白烧掉。
-    let _guard = manager.enter_ip(key_sig, get_canonical_ip(peer_ip))?;
+    //    函数结束时 _ip_guard 被销毁，自动调用 leave_ip
+    let _ip_guard = manager.enter_ip(key_sig, get_canonical_ip(peer_ip))?;
     if !consume_token(&uuid, verified.expire_at) {
         // 不打印原始 token，避免日志泄露可用于重放的凭证
         warn!(
@@ -247,259 +287,280 @@ async fn handle_client(
             key_sig,
             token_fingerprint(&uuid)
         );
-        return handle_tls_fallback(&peek[..offset], client_reader, client_writer).await;
+        // 回落到 Web 服务前先释放 IP 名额，避免重放连接占用合法用户配额
+        drop(_ip_guard);
+        return handle_tls_fallback(&peek[..offset], stream).await;
     }
 
     let limiter = manager.get_user_limiter(key_sig, verified.profile.rate_limit);
-    let limiter_upload = limiter.clone();
+    let limiter = limiter.as_deref();
 
-    let stat_map_upload = stat_map.clone();
-    let stat_map_download = stat_map.clone();
+    response_to_client(&mut stream, &Response::Success).await?;
 
+    // 握手包之后客户端可能已经发来了数据，先把这部分接到读端前面
     let remaining = peek[consumed_len..offset].to_vec();
-    let mut chained_reader = AsyncReadExt::chain(Cursor::new(remaining), client_reader);
-
-    response_to_client(&mut client_writer, &Response::Success).await?;
+    let (client_reader, client_writer) = tokio::io::split(stream);
+    let client_reader = AsyncReadExt::chain(Cursor::new(remaining), client_reader);
 
     match cmd {
-        // === TCP 模式 ===
         Command::TcpConnect => {
-            let target = TcpStream::connect((addr.addr(), addr.port())).await?;
+            let target = addr.connect_tcp().await?;
             info!("Tcp connect to {}", addr);
-            let (mut target_r, mut target_w) = target.into_split();
-
-            // 创建停机信号
-            let shutdown_tcp = Arc::new(Notify::new());
-            let shutdown_tcp_rx_local = shutdown_tcp.clone();
-            let shutdown_tcp_rx_remote = shutdown_tcp.clone();
-            let shutdown_tcp_tx_local = shutdown_tcp.clone();
-            let shutdown_tcp_tx_remote = shutdown_tcp.clone();
-
-            // 目标 -> 代理 -> 客户端
-            tokio::spawn(async move {
-                let mut target_to_client_buf = BytesMut::with_capacity(RELAY_BUFFER_SIZE);
-                let mut graceful_eof = false;
-                loop {
-                    // 复位 len 让 read_buf 能用满整块容量；只清长度，不清零数据
-                    target_to_client_buf.clear();
-                    let n = select! {
-                        _ = shutdown_tcp_rx_remote.notified() => break,
-                        n = target_r.read_buf(&mut target_to_client_buf) => n
-                    };
-                    let length = match n {
-                        Ok(0) => {
-                            graceful_eof = true;
-                            break;
-                        }
-                        Ok(n) => n,
-                        Err(e) => {
-                            error!("read form target error: {}", e);
-                            break;
-                        }
-                    };
-
-                    // 【限速点】: 写入目标服务器之前扣除令牌
-                    if let Some(ref limiter) = limiter
-                        && let Some(nz) = std::num::NonZeroU32::new(length as u32)
-                    {
-                        limiter.until_n_ready(nz).await.ok();
-                    }
-
-                    if let Err(e) = client_writer
-                        .write_all(&target_to_client_buf[..length])
-                        .await
-                    {
-                        error!("Target write to client error {}", e);
-                        break;
-                    }
-                    // tokio-rustls 的 write_all 只保证数据进入 rustls 的发送缓冲，
-                    // 不 flush 就可能一直滞留对端收不到、同时失去背压：目标侧读阻塞后
-                    // 这个循环再也不会 poll 写入端，尾部数据永远发不出去，大响应会中途卡死。
-                    if let Err(e) = client_writer.flush().await {
-                        error!("Target flush to client error {}", e);
-                        break;
-                    }
-                    stat_map_download.update_download(key_sig, length);
-                }
-                // 目标侧 EOF 表示响应正常结束：只把半关闭传递出去（关闭对客户端的写端，
-                // 让对端看到 EOF），不连带掐断另一方向；只有出错时才连带拆除隧道。
-                if !graceful_eof {
-                    shutdown_tcp_tx_remote.notify_waiters();
-                }
-                let _ = client_writer.shutdown().await;
-            });
-
-            // 客户端 -> 代理 -> 目标
-            let mut client_to_target_buf = BytesMut::with_capacity(RELAY_BUFFER_SIZE);
-            let mut graceful_eof = false;
-            loop {
-                // 复位 len 让 read_buf 能用满整块容量；只清长度，不清零数据
-                client_to_target_buf.clear();
-                let n = select! {
-                    _ = shutdown_tcp_rx_local.notified() => break,
-                    n = chained_reader.read_buf(&mut client_to_target_buf) => n
-                };
-                let length = match n {
-                    Ok(0) => {
-                        graceful_eof = true;
-                        break;
-                    }
-                    Ok(n) => n,
-                    Err(e) => {
-                        error!("Read from client error {}", e);
-                        break;
-                    }
-                };
-                if let Some(ref limiter) = limiter_upload
-                    && let Some(nz) = std::num::NonZeroU32::new(length as u32)
-                {
-                    limiter.until_n_ready(nz).await.ok();
-                };
-
-                if let Err(e) = target_w.write_all(&client_to_target_buf[..length]).await {
-                    error!("Write to target error {}", e);
-                    break;
-                }
-                stat_map_upload.update_upload(key_sig, length);
-            }
-            // 客户端侧 EOF：把半关闭传给目标（很多目标要靠这个 FIN 才回包），
-            // 不连带掐断下载方向；只有出错时才拆除整条隧道。
-            if !graceful_eof {
-                shutdown_tcp_tx_local.notify_waiters();
-            }
-            let _ = target_w.shutdown().await;
+            let (target_r, target_w) = target.into_split();
+            let cancel = CancellationToken::new();
+            relay_bidirectional(
+                client_reader,
+                client_writer,
+                target_r,
+                target_w,
+                limiter,
+                &cancel,
+                |n| stat_map.update_upload(key_sig, n),
+                |n| stat_map.update_download(key_sig, n),
+            )
+            .await;
         }
-
-        // === UDP 模式 (Full Cone) ===
         Command::UdpAssociate => {
-            // 创建停机信号
-            let shutdown = Arc::new(Notify::new());
-            let shutdown_rx_1 = shutdown.clone();
-            let shutdown_tx_1 = shutdown.clone();
-            let shutdown_rx_2 = shutdown.clone();
-            let shutdown_tx_2 = shutdown.clone();
-
-            // RFC 4787 NATs维护UDP映射超时时间应不少于2分钟
-            let whitelist: Cache<String, ()> = Cache::builder()
-                .max_capacity(10000)
-                .time_to_idle(Duration::from_secs(120))
-                .build();
-
-            let socket = Arc::new(bind_dual_stack_udp()?);
-
-            // 外部 -> 代理 -> 客户端
-            let sock_recv = socket.clone();
-            let whitelist_recv = whitelist.clone();
-
-            let inbound_task = tokio::spawn(async move {
-                let mut buf = BytesMut::with_capacity(UDP_BUFFER_SIZE);
-                loop {
-                    if buf.capacity() < UDP_BUFFER_SIZE {
-                        buf.reserve(UDP_BUFFER_SIZE);
-                    }
-                    buf.resize(UDP_BUFFER_SIZE, 0);
-
-                    let (n, src_addr) = select! {
-                        _ = shutdown_rx_1.notified() => break,
-                        res = sock_recv.recv_from(&mut buf) => {
-                            match res {
-                                Ok(res) => res,
-                                Err(e) => {
-                                    error!("Receive data from socket Error: {}", e);
-                                    break;
-                                }
-                            }
-                        }
-                    };
-                    if n == 0 {
-                        break;
-                    }
-
-                    let canonical_ip = get_canonical_ip(src_addr.ip());
-
-                    let allow = match nat_type {
-                        NATType::FullCone => true,
-                        NATType::Restricted => {
-                            let key = canonical_ip.to_string();
-                            whitelist_recv.contains_key(&key) // O(1) 查询
-                        }
-                        NATType::PortRestricted => {
-                            let key = format!("{}:{}", canonical_ip, src_addr.port());
-                            whitelist_recv.contains_key(&key) // O(1) 查询
-                        }
-                    };
-
-                    if allow {
-                        let packet = buf.split_to(n);
-                        let net_addr = match canonical_ip {
-                            IpAddr::V4(ip) => NetAddr::new_ipv4(ip, src_addr.port()),
-                            IpAddr::V6(ip) => NetAddr::new_ipv6(ip, src_addr.port()),
-                        };
-                        let cmd = build_udp_frame(&net_addr, &packet.freeze());
-                        match cmd {
-                            Ok(c) => {
-                                if let Some(ref limiter) = limiter
-                                    && let Some(nz) = std::num::NonZeroU32::new(n as u32)
-                                {
-                                    limiter.until_n_ready(nz).await.ok();
-                                };
-                                if let Err(e) = client_writer.write_all(&c).await {
-                                    error!("Server write udp to client error {}", e);
-                                    break;
-                                }
-                                stat_map_download.update_download(key_sig, n);
-                            }
-                            Err(e) => {
-                                error!("build udp frame fail {}", e);
-                            }
-                        };
-                    }
-                }
-                shutdown_tx_1.notify_waiters();
-            });
-
-            // 客户端 -> 代理 -> 外部
-            let sock_send = socket.clone();
-            let outbound_task = tokio::spawn(async move {
-                loop {
-                    let resp = select! {
-                        _ = shutdown_rx_2.notified() => break,
-                        resp = read_udp_frame(&mut chained_reader) => resp,
-                    };
-                    match resp {
-                        Ok((addr, payload)) => {
-                            if nat_type == NATType::Restricted {
-                                whitelist.insert(addr.addr(), ()).await;
-                            } else if nat_type == NATType::PortRestricted {
-                                whitelist.insert(addr.to_string(), ()).await;
-                            }
-
-                            if let Some(ref limiter) = limiter_upload
-                                && let Some(nz) = std::num::NonZeroU32::new(payload.len() as u32)
-                            {
-                                limiter.until_n_ready(nz).await.ok();
-                            };
-                            info!("Udp connect to {}", addr);
-                            if let Err(e) = sock_send
-                                .send_to(&payload, (addr.addr(), addr.port()))
-                                .await
-                            {
-                                error!("Write udp to target error: {:?}", e);
-                                break;
-                            };
-                            stat_map_upload.update_upload(key_sig, payload.len());
-                        }
-                        Err(_) => break,
-                    }
-                }
-                shutdown_tx_2.notify_waiters();
-            });
-
-            // 等待任意一个方向结束
-            let _ = tokio::join!(inbound_task, outbound_task);
+            relay_udp(
+                client_reader,
+                client_writer,
+                nat_type,
+                limiter,
+                stat_map,
+                key_sig,
+            )
+            .await?;
         }
     }
 
-    // 函数结束时，_guard 被销毁，自动调用 leave_ip
     Ok(())
+}
+
+/// NAT 白名单的 key：Restricted 只看 IP（端口记为 0），PortRestricted 看 IP + 端口
+fn nat_key(nat_type: NATType, addr: SocketAddr) -> (IpAddr, u16) {
+    let ip = get_canonical_ip(addr.ip());
+    match nat_type {
+        NATType::PortRestricted => (ip, addr.port()),
+        _ => (ip, 0),
+    }
+}
+
+/// 解析 UDP 目标的候选地址列表：命中未过期缓存时直接返回上次可用的地址，否则解析全部候选地址
+async fn resolve_candidates(
+    cache: &HashMap<String, (SocketAddr, Instant)>,
+    addr: &NetAddr,
+) -> std::io::Result<Vec<SocketAddr>> {
+    if let Some(socket_addr) = addr.socket_addr() {
+        return Ok(vec![socket_addr]);
+    }
+    if let Some((resolved, at)) = cache.get(&addr.to_string())
+        && at.elapsed() < UDP_DNS_CACHE_TTL
+    {
+        return Ok(vec![*resolved]);
+    }
+    addr.resolve_all().await
+}
+
+/// 缓存域名实际发送成功的 SocketAddr，避免后续包重复做 DNS 解析或反复尝试不可达地址族
+fn cache_resolved_udp(
+    cache: &mut HashMap<String, (SocketAddr, Instant)>,
+    addr: &NetAddr,
+    resolved: SocketAddr,
+) {
+    if !matches!(addr, NetAddr::Domain(..)) {
+        return;
+    }
+    if cache.len() >= UDP_DNS_CACHE_MAX {
+        cache.retain(|_, (_, at)| at.elapsed() < UDP_DNS_CACHE_TTL);
+        if cache.len() >= UDP_DNS_CACHE_MAX {
+            cache.clear();
+        }
+    }
+    cache.insert(addr.to_string(), (resolved, Instant::now()));
+}
+
+/// 依次尝试向候选地址发送 UDP 数据包，返回首个发送成功的地址。
+///
+/// 解决纯 IPv4 机器绑定双栈 `[::]` socket 时 DNS 优先返回 `AAAA` 导致 `ENETUNREACH` 的问题。
+async fn send_udp_first_reachable(
+    socket: &tokio::net::UdpSocket,
+    payload: &[u8],
+    candidates: &[SocketAddr],
+    nat_type: NATType,
+    whitelist: Option<&Cache<(IpAddr, u16), ()>>,
+) -> std::io::Result<SocketAddr> {
+    let mut last_err = None;
+    for &target in candidates {
+        let key = nat_key(nat_type, target);
+        if let Some(wl) = whitelist {
+            wl.insert(key, ()).await;
+        }
+        match socket.send_to(payload, to_dual_stack(target)).await {
+            Ok(_) => return Ok(target),
+            Err(e) => {
+                if let Some(wl) = whitelist {
+                    wl.invalidate(&key).await;
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no candidate")))
+}
+
+/// UDP 模式：TLS 隧道 <-> 本地 UDP socket
+async fn relay_udp<R, W>(
+    mut client_reader: R,
+    mut client_writer: W,
+    nat_type: NATType,
+    limiter: Option<&UserLimiter>,
+    stat_map: &ServerStatistic,
+    key_sig: [u8; 4],
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let socket = bind_dual_stack_udp()?;
+    // Full Cone 不需要白名单，避免为每个关联都建一个缓存
+    let whitelist: Option<Cache<(IpAddr, u16), ()>> = match nat_type {
+        NATType::FullCone => None,
+        _ => Some(
+            Cache::builder()
+                .max_capacity(10000)
+                .time_to_idle(NAT_MAPPING_IDLE)
+                .build(),
+        ),
+    };
+    let cancel = CancellationToken::new();
+
+    // 外部 -> 代理 -> 客户端
+    let inbound = async {
+        let mut buf = vec![0u8; UDP_BUFFER_SIZE];
+        let mut frame = Vec::with_capacity(UDP_BUFFER_SIZE + 32);
+        loop {
+            let (n, src_addr) = match socket.recv_from(&mut buf).await {
+                Ok(res) => res,
+                // Windows 下向不可达 UDP 端口发送后，ICMP Port Unreachable 会在下次 recv_from 报 ConnectionReset
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
+                Err(e) => {
+                    error!("Receive data from socket Error: {}", e);
+                    break;
+                }
+            };
+
+            if let Some(whitelist) = &whitelist
+                && !whitelist.contains_key(&nat_key(nat_type, src_addr))
+            {
+                continue;
+            }
+
+            let src = SocketAddr::new(get_canonical_ip(src_addr.ip()), src_addr.port());
+            frame.clear();
+            if let Err(e) = encode_udp_frame(&NetAddr::from(src), &buf[..n], &mut frame) {
+                error!("build udp frame fail {}", e);
+                continue;
+            }
+            if let Some(limiter) = limiter {
+                limiter.consume(n).await;
+            }
+            if let Err(e) = write_and_flush(&mut client_writer, &frame).await {
+                error!("Server write udp to client error {}", e);
+                break;
+            }
+            stat_map.update_download(key_sig, n);
+        }
+    };
+
+    // 客户端 -> 代理 -> 外部
+    let outbound = async {
+        let mut dns_cache = HashMap::new();
+        loop {
+            let (addr, payload) = match read_udp_frame(&mut client_reader).await {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+            let candidates = match resolve_candidates(&dns_cache, &addr).await {
+                Ok(candidates) => candidates,
+                Err(e) => {
+                    warn!("Resolve udp target {} error: {}", addr, e);
+                    continue;
+                }
+            };
+            if let Some(limiter) = limiter {
+                limiter.consume(payload.len()).await;
+            }
+            debug!("Udp send to {}", addr);
+            match send_udp_first_reachable(
+                &socket,
+                &payload,
+                &candidates,
+                nat_type,
+                whitelist.as_ref(),
+            )
+            .await
+            {
+                Ok(chosen) => {
+                    cache_resolved_udp(&mut dns_cache, &addr, chosen);
+                    stat_map.update_upload(key_sig, payload.len());
+                }
+                Err(e) => {
+                    // 单个目标发送失败（如目标网络不可达）不应拆除整条 UDP 关联
+                    if matches!(addr, NetAddr::Domain(..)) {
+                        dns_cache.remove(&addr.to_string());
+                    }
+                    warn!("Write udp to target {} error: {}", addr, e);
+                    continue;
+                }
+            }
+        }
+    };
+
+    // 任意一个方向结束都拆除整个关联
+    tokio::join!(
+        async {
+            cancel.run_until_cancelled(inbound).await;
+            cancel.cancel();
+        },
+        async {
+            cancel.run_until_cancelled(outbound).await;
+            cancel.cancel();
+        },
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv6Addr;
+
+    #[tokio::test]
+    async fn test_send_udp_falls_back_to_next_candidate() {
+        let socket = bind_dual_stack_udp().unwrap();
+        let recv = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_addr = recv.local_addr().unwrap();
+        // 未指定地址 [::]:0 在各平台 send_to 均会失败，用来模拟不可达的首选候选地址
+        let invalid = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0));
+        let whitelist: Cache<(IpAddr, u16), ()> = Cache::builder().max_capacity(16).build();
+
+        let chosen = send_udp_first_reachable(
+            &socket,
+            b"ping",
+            &[invalid, recv_addr],
+            NATType::PortRestricted,
+            Some(&whitelist),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(chosen, recv_addr);
+        assert!(!whitelist.contains_key(&nat_key(NATType::PortRestricted, invalid)));
+        assert!(whitelist.contains_key(&nat_key(NATType::PortRestricted, recv_addr)));
+
+        let mut buf = [0u8; 16];
+        let (n, _) = recv.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ping");
+    }
 }

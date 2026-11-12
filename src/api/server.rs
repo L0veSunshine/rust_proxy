@@ -92,7 +92,7 @@ async fn list_all_user_profile(
     let resp = user_list
         .into_iter()
         .map(|i| UserProfileView {
-            id: hex::encode(i.secret),
+            id: hex::encode(i.key_id),
             max_ip: i.max_ip,
             rate_limit: i.rate_limit,
         })
@@ -104,8 +104,7 @@ async fn delete_user(
     State(state): State<Arc<AppState>>,
     Path(id_hex): Path<String>,
 ) -> ServiceResult<StatusCode> {
-    let bytes = hex::decode(&id_hex).map_err(|_| ServiceError::InvalidKeyId)?;
-    let key_id: [u8; 4] = bytes.try_into().map_err(|_| ServiceError::InvalidKeyId)?;
+    let key_id = decode_id(&id_hex)?;
     state.manager.delete_user(key_id)?;
     Ok(StatusCode::NO_CONTENT)
 }

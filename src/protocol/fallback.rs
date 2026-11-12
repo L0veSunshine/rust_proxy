@@ -1,46 +1,28 @@
 use anyhow::Result;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::select;
 
-pub async fn handle_tls_fallback(
-    initial_data: &[u8],
-    mut client_reader: tokio::io::ReadHalf<tokio_rustls::server::TlsStream<TcpStream>>,
-    mut client_writer: tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStream>>,
-) -> Result<()> {
-    // 连接本地 Web 服务器
-    let web_server = TcpStream::connect("127.0.0.1:80").await?;
+const FALLBACK_ADDR: &str = "127.0.0.1:80";
 
-    let (mut web_reader, mut web_writer) = web_server.into_split();
-
-    // 1. 先把刚才“偷看”的数据补发给 Web 服务器
+/// 把已解密的 TLS 流量回落到本地 Web 服务器。
+///
+/// `initial_data` 是握手阶段已经读出的数据，需要先补发给 Web 服务器。
+/// 使用 `copy_bidirectional`：两个方向在同一个任务内完成并正确传递半关闭，
+/// 不会留下无人管理的后台任务。
+pub async fn handle_tls_fallback<S>(initial_data: &[u8], mut client: S) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut web_server = TcpStream::connect(FALLBACK_ADDR).await?;
     if !initial_data.is_empty() {
-        web_writer.write_all(initial_data).await?;
+        web_server.write_all(initial_data).await?;
     }
-
-    // 2. 建立双向转发
-    // Client -> Web Server
-    let client_to_web =
-        tokio::spawn(async move { tokio::io::copy(&mut client_reader, &mut web_writer).await });
-
-    // Web Server -> Client
-    let web_to_client =
-        tokio::spawn(async move { tokio::io::copy(&mut web_reader, &mut client_writer).await });
-
-    // 等待任一方向结束
-    select! {
-        _ = client_to_web => {},
-        _ = web_to_client => {},
-    }
-
+    tokio::io::copy_bidirectional(&mut client, &mut web_server).await?;
     Ok(())
 }
 
-pub async fn handle_tcp_fallback(mut client_socket: &mut TcpStream) -> Result<()> {
-    let mut web_server = TcpStream::connect("127.0.0.1:80").await?;
-
-    // 使用 copy_bidirectional 进行双向拷贝，比手动 spawn 两个任务更高效简洁
+pub async fn handle_tcp_fallback(mut client_socket: TcpStream) -> Result<()> {
+    let mut web_server = TcpStream::connect(FALLBACK_ADDR).await?;
     tokio::io::copy_bidirectional(&mut client_socket, &mut web_server).await?;
-
     Ok(())
 }

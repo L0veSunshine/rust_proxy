@@ -1,45 +1,75 @@
-use crate::RELAY_BUFFER_SIZE;
 use crate::api::client::{add_download, add_upload};
 use crate::protocol::http;
 use crate::protocol::message::{
-    Command, Response, build_udp_frame, client_hello, read_response_from_server, read_udp_frame,
+    Command, Response, client_hello, encode_udp_frame, read_response_from_server, read_udp_frame,
 };
+use crate::protocol::net_addr::NetAddr;
 use crate::protocol::socks5;
-use crate::protocol::socks5::build_udp_packet;
-use crate::protocol::utils::bind_dual_stack_udp;
+use crate::protocol::utils::{bind_dual_stack_udp, get_canonical_ip};
+use crate::relay::{relay_bidirectional, write_and_flush};
 use crate::secret::tls;
 use crate::secret::totp::generate_totp_uuid;
+use crate::server::UDP_BUFFER_SIZE;
 use anyhow::{Result, bail};
-use bytes::BytesMut;
 use rustls::pki_types::ServerName;
 use socket2::{SockRef, TcpKeepalive};
-use std::convert::TryFrom;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::select;
-use tokio::sync::{Mutex, Notify};
-use tracing::{error, info};
+use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+/// accept 出错后的退避时间，避免空转
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+type TlsReader = ReadHalf<TlsStream<TcpStream>>;
+type TlsWriter = WriteHalf<TlsStream<TcpStream>>;
 
 pub async fn run(listen: String, server: String, ca_path: String, shared_key: Uuid) -> Result<()> {
     let connector = Arc::new(tls::create_client_config(&ca_path)?);
     let listener = TcpListener::bind(&listen).await?;
-    let ka = TcpKeepalive::new().with_time(Duration::from_secs(60)); // 空闲60秒后开始探测
     println!("Client listening on {}", listen);
+    serve(listener, server, connector, shared_key).await
+}
 
+/// 在已绑定的本地监听器上接受 SOCKS5 / HTTP 代理请求
+pub async fn serve(
+    listener: TcpListener,
+    server: String,
+    connector: Arc<TlsConnector>,
+    shared_key: Uuid,
+) -> Result<()> {
+    let ka = TcpKeepalive::new().with_time(Duration::from_secs(60)); // 空闲60秒后开始探测
     let server = Arc::new(server);
     loop {
-        let (socket, _) = listener.accept().await?;
-        let native_socket = SockRef::from(&socket);
-        native_socket.set_tcp_nodelay(true)?;
-        native_socket.set_tcp_keepalive(&ka)?;
-        let server_cloned = server.clone();
+        let socket = match listener.accept().await {
+            Ok((socket, _)) => socket,
+            Err(e) => {
+                error!("Client accept error: {}", e);
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                continue;
+            }
+        };
+        // 单个 socket 设置失败只影响这条连接，不能让整个客户端退出
+        let sock_opts = {
+            let native_socket = SockRef::from(&socket);
+            native_socket
+                .set_tcp_nodelay(true)
+                .and_then(|_| native_socket.set_tcp_keepalive(&ka))
+        };
+        if let Err(e) = sock_opts {
+            warn!("Failed to set socket options: {}", e);
+            continue;
+        }
+        let server = server.clone();
         let connector = connector.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(socket, server_cloned, connector, shared_key).await {
+            if let Err(e) = handle_conn(socket, &server, &connector, shared_key).await {
                 error!("Client Error: {}", e);
             };
         });
@@ -48,255 +78,115 @@ pub async fn run(listen: String, server: String, ca_path: String, shared_key: Uu
 
 pub async fn handle_response<R: AsyncRead + Unpin>(tls_r: &mut R) -> Result<()> {
     let resp = read_response_from_server(tls_r).await?;
-    if let Ok(resp) = Response::try_from(resp)
-        && resp == Response::Success
-    {
-        return Ok(());
+    match Response::try_from(resp) {
+        Ok(Response::Success) => Ok(()),
+        _ => bail!("build connect failed"),
     }
-    error!("build connect failed");
-    bail!("build connect failed");
 }
 
 async fn handle_conn(
     local: TcpStream,
-    server: Arc<String>,
-    connector: Arc<tokio_rustls::TlsConnector>,
-    sharked_key: Uuid,
+    server: &str,
+    connector: &TlsConnector,
+    shared_key: Uuid,
 ) -> Result<()> {
     // 检测协议类型：peek 第一个字节
-    // SOCKS5: 0x05
-    // HTTP CONNECT: 'C' (0x43)
+    // SOCKS5 版本号固定为 0x05；HTTP 方法以 ASCII 字母开头 (G, P, C, D, H, O, T 等)
     let mut buf = [0u8; 1];
     local.peek(&mut buf).await?;
 
-    let first_byte = buf[0];
-
-    // 判断是 SOCKS5 还是 HTTP 代理
-    // SOCKS5 版本号固定为 0x05
-    // HTTP 方法通常以 ASCII 字符开头 (G, P, C, D, H, O, T 等)
-    // 所以只要不是 0x05，我们就认为是 HTTP 流量
-    let is_http = first_byte != 0x05;
-
-    if is_http {
-        // HTTP 代理处理
-        handle_http_proxy(local, server, connector, sharked_key).await
+    if buf[0] == 0x05 {
+        handle_socks5_proxy(local, server, connector, shared_key).await
     } else {
-        // SOCKS5 代理处理
-        handle_socks5_proxy(local, server, connector, sharked_key).await
+        handle_http_proxy(local, server, connector, shared_key).await
     }
 }
 
-/// 双向数据中继:在两个流之间双向转发数据
-fn relay_bidirectional<R, W>(
-    mut reader: R,
-    mut writer: W,
-    shutdown_tx: Arc<Notify>,
-    shutdown_rx: Arc<Notify>,
-    add_metrics: fn(usize),
-    direction: &'static str,
-) -> tokio::task::JoinHandle<()>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWriteExt + Unpin + Send + 'static,
-{
-    tokio::spawn(async move {
-        let mut buf = BytesMut::with_capacity(RELAY_BUFFER_SIZE);
-        let mut graceful_eof = false;
-        loop {
-            // 复位 len 让 read_buf 能用满整块容量；只清长度，不清零数据
-            buf.clear();
-            let n: usize = select! {
-                _ = shutdown_rx.notified() => 0,
-                res = reader.read_buf(&mut buf) => {
-                    match res {
-                        Ok(0) => {
-                            graceful_eof = true;
-                            break;
-                        }
-                        Ok(n) => n,
-                        Err(e) => {
-                            error!("Client read from {} error: {}", direction, e);
-                            break;
-                        }
-                    }
-                },
-            };
-            if n == 0 {
-                break;
-            }
-            if let Err(e) = writer.write_all(&buf[..n]).await {
-                error!("Client write to {} error: {}", direction, e);
-                break;
-            }
-            // 写入端可能是 TLS(上行方向)：write_all 不保证刷出，必须显式 flush
-            if let Err(e) = writer.flush().await {
-                error!("Client flush to {} error: {}", direction, e);
-                break;
-            }
-            add_metrics(n);
-        }
-        // 读端 EOF 只是本方向结束(半关闭)：把 FIN 传给对端即可，不能掐断另一方向，
-        // 否则"请求发完就半关闭"的客户端（以及要靠 FIN 才回包的目标）拿不到响应。
-        // 只有出错或对端要求停止时才连带拆除整条隧道。
-        if !graceful_eof {
-            shutdown_tx.notify_waiters();
-        }
-        let _ = writer.shutdown().await;
-    })
+/// 连接代理服务端并完成 TLS 握手
+async fn connect_server(server: &str, connector: &TlsConnector) -> Result<(TlsReader, TlsWriter)> {
+    let remote = TcpStream::connect(server).await?;
+    let domain = ServerName::try_from("localhost")?;
+    let tls_stream = connector.connect(domain, remote).await?;
+    Ok(tokio::io::split(tls_stream))
+}
+
+/// 本地 TCP 与 TLS 隧道之间的双向转发
+async fn relay_tcp(local: TcpStream, tls_r: TlsReader, tls_w: TlsWriter) {
+    let (local_r, local_w) = local.into_split();
+    let cancel = CancellationToken::new();
+    relay_bidirectional(
+        local_r,
+        local_w,
+        tls_r,
+        tls_w,
+        None,
+        &cancel,
+        add_upload,
+        add_download,
+    )
+    .await;
 }
 
 /// 处理 HTTP 代理请求
 async fn handle_http_proxy(
     mut local: TcpStream,
-    server: Arc<String>,
-    connector: Arc<tokio_rustls::TlsConnector>,
-    sharked_key: Uuid,
+    server: &str,
+    connector: &TlsConnector,
+    shared_key: Uuid,
 ) -> Result<()> {
-    // HTTP 握手
     let req = http::handshake(&mut local).await?;
+    let (mut tls_r, mut tls_w) = connect_server(server, connector).await?;
+    let dynamic_uuid = generate_totp_uuid(shared_key.as_bytes());
 
-    // 连接 TLS 服务端
-    let remote = TcpStream::connect(&*server).await?;
-    let domain = ServerName::try_from("localhost")?;
-    let tls_stream = connector.connect(domain, remote).await?;
-
-    let (mut tls_r, mut tls_w) = tokio::io::split(tls_stream);
-    let dynamic_uuid = generate_totp_uuid(sharked_key.as_bytes());
-
-    match req {
-        http::HttpRequest::Connect(target_addr) => {
-            info!("HTTPS connect to: {}", target_addr);
-            // 发送带 Padding 和 Auth 的握手
-            client_hello(
-                &mut tls_w,
-                &dynamic_uuid,
-                &Command::TcpConnect,
-                &target_addr,
-            )
-            .await?;
-
-            // 0-RTT
-            handle_response(&mut tls_r).await?;
-
-            // 发送 HTTP 200 Connection Established 响应
-            http::send_connect_success(&mut local).await?;
-
-            let (local_r, local_w) = local.into_split();
-
-            let shutdown = Arc::new(Notify::new());
-            let shutdown_tx_local = shutdown.clone();
-            let shutdown_rx_local = shutdown.clone();
-            let shutdown_tx_remote = shutdown.clone();
-            let shutdown_rx_remote = shutdown.clone();
-
-            // 本地 -> 代理
-            let handle_upload = relay_bidirectional(
-                local_r,
-                tls_w,
-                shutdown_tx_local,
-                shutdown_rx_local,
-                add_upload,
-                "local",
-            );
-
-            // 代理 -> 本地
-            let handle_download = relay_bidirectional(
-                tls_r,
-                local_w,
-                shutdown_tx_remote,
-                shutdown_rx_remote,
-                add_download,
-                "server",
-            );
-
-            // 等待两个方向的 relay 都完成
-            let _ = tokio::join!(handle_upload, handle_download);
+    // CONNECT：先回 200，再把请求头之后已收到的数据转发出去
+    // 普通 HTTP：请求行 + 头部本身就要转发给目标
+    let (target_addr, initial_data, is_connect) = match req {
+        http::HttpRequest::Connect(addr, early_data) => {
+            info!("HTTPS connect to: {}", addr);
+            (addr, early_data, true)
         }
-        http::HttpRequest::Http(target_addr, initial_data) => {
-            info!("HTTP connect to: {}", target_addr);
-            // 发送带 Padding 和 Auth 的握手
-            client_hello(
-                &mut tls_w,
-                &dynamic_uuid,
-                &Command::TcpConnect,
-                &target_addr,
-            )
-            .await?;
-
-            // 0-RTT
-            handle_response(&mut tls_r).await?;
-
-            // HTTP 代理不需要发送 200 Connection Established
-            // 但需要把握手期间读取的 initial_data (请求行+头部) 转发给服务端
-            if let Err(e) = tls_w.write_all(&initial_data).await {
-                error!(
-                    "Client write initial http data to proxy server error: {}",
-                    e
-                );
-                return Err(anyhow::anyhow!("Failed to write initial data"));
-            }
-            // HTTP 路径的请求不经过 relay，必须在这里刷出去；否则后续 relay
-            // 不会再写这个 TLS 写入端，请求会滞留在 rustls 发送缓冲里
-            tls_w.flush().await?;
-
-            let (local_r, local_w) = local.into_split();
-
-            let shutdown = Arc::new(Notify::new());
-            let shutdown_tx_local = shutdown.clone();
-            let shutdown_rx_local = shutdown.clone();
-            let shutdown_tx_remote = shutdown.clone();
-            let shutdown_rx_remote = shutdown.clone();
-
-            // 本地 -> 代理
-            let handle_upload = relay_bidirectional(
-                local_r,
-                tls_w,
-                shutdown_tx_local,
-                shutdown_rx_local,
-                add_upload,
-                "local",
-            );
-
-            // 代理 -> 本地
-            let handle_download = relay_bidirectional(
-                tls_r,
-                local_w,
-                shutdown_tx_remote,
-                shutdown_rx_remote,
-                add_download,
-                "server",
-            );
-
-            // 等待两个方向的 relay 都完成
-            let _ = tokio::join!(handle_upload, handle_download);
+        http::HttpRequest::Http(addr, data) => {
+            info!("HTTP connect to: {}", addr);
+            (addr, data, false)
         }
+    };
+
+    // 发送带 Padding 和 Auth 的握手
+    client_hello(
+        &mut tls_w,
+        &dynamic_uuid,
+        &Command::TcpConnect,
+        &target_addr,
+    )
+    .await?;
+    handle_response(&mut tls_r).await?;
+
+    if is_connect {
+        http::send_connect_success(&mut local).await?;
     }
+    if !initial_data.is_empty() {
+        write_and_flush(&mut tls_w, &initial_data).await?;
+        add_upload(initial_data.len());
+    }
+
+    relay_tcp(local, tls_r, tls_w).await;
     Ok(())
 }
 
 /// 处理 SOCKS5 代理请求
 async fn handle_socks5_proxy(
     mut local: TcpStream,
-    server: Arc<String>,
-    connector: Arc<tokio_rustls::TlsConnector>,
-    sharked_key: Uuid,
+    server: &str,
+    connector: &TlsConnector,
+    shared_key: Uuid,
 ) -> Result<()> {
-    // SOCKS5 握手
     let req = socks5::handshake(&mut local).await?;
-
-    // 连接 TLS 服务端
-    let remote = TcpStream::connect(&*server).await?;
-    let domain = ServerName::try_from("localhost")?;
-    let tls_stream = connector.connect(domain, remote).await?;
-
-    // let (tx, mut rx) = mpsc::channel::<Command>(100);
-    let (mut tls_r, mut tls_w) = tokio::io::split(tls_stream);
-    let dynamic_uuid = generate_totp_uuid(sharked_key.as_bytes());
+    let (mut tls_r, mut tls_w) = connect_server(server, connector).await?;
+    let dynamic_uuid = generate_totp_uuid(shared_key.as_bytes());
 
     match req {
         socks5::SocksRequest::Tcp(target_addr) => {
             info!("SOCK5 Tcp connect to {}", target_addr);
-            // 发送带 Padding 和 Auth 的握手
             client_hello(
                 &mut tls_w,
                 &dynamic_uuid,
@@ -304,45 +194,15 @@ async fn handle_socks5_proxy(
                 &target_addr,
             )
             .await?;
-            let loop_back_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
-            socks5::send_reply(&mut local, loop_back_addr).await?;
-
-            let (local_r, local_w) = local.into_split();
-            // 0-RTT
+            // 0-RTT：不等服务端响应就先回复本地应用
+            let unspecified = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
+            socks5::send_reply(&mut local, unspecified).await?;
             handle_response(&mut tls_r).await?;
 
-            let shutdown = Arc::new(Notify::new());
-            let shutdown_tx_local = shutdown.clone();
-            let shutdown_rx_local = shutdown.clone();
-            let shutdown_tx_remote = shutdown.clone();
-            let shutdown_rx_remote = shutdown.clone();
-
-            // 本地 -> 代理
-            let handle_upload = relay_bidirectional(
-                local_r,
-                tls_w,
-                shutdown_tx_local,
-                shutdown_rx_local,
-                add_upload,
-                "local",
-            );
-
-            // 代理 -> 本地
-            let handle_download = relay_bidirectional(
-                tls_r,
-                local_w,
-                shutdown_tx_remote,
-                shutdown_rx_remote,
-                add_download,
-                "server",
-            );
-
-            // 等待两个方向的 relay 都完成
-            let _ = tokio::join!(handle_upload, handle_download);
+            relay_tcp(local, tls_r, tls_w).await;
         }
 
         socks5::SocksRequest::Udp(target_addr) => {
-            // 发送 UDP Associate 握手
             info!("SOCK5 Udp connect to {}", target_addr);
             client_hello(
                 &mut tls_w,
@@ -354,105 +214,127 @@ async fn handle_socks5_proxy(
 
             // 绑定双栈 Socket (实际上绑定了 [::]:0，同时覆盖 IPv4/IPv6)
             let udp = bind_dual_stack_udp()?;
-            let local_port = udp.local_addr()?.port();
-
-            // 获取当前 TCP 连接的本地目标 IP
-            let local_tcp_addr = local.local_addr()?;
-
-            let reply_addr = SocketAddr::new(local_tcp_addr.ip(), local_port);
+            let reply_addr = SocketAddr::new(local.local_addr()?.ip(), udp.local_addr()?.port());
             socks5::send_reply(&mut local, reply_addr).await?;
-
-            let udp = Arc::new(udp);
-
-            // 记录本地应用的来源地址 (IP:Port)
-            // 只要收到该应用的包，就更新这个地址；收到服务端回包，就发往这个地址
-            let client_src = Arc::new(Mutex::new(None::<SocketAddr>));
-
-            // 0-RTT
             handle_response(&mut tls_r).await?;
 
-            let shutdown = Arc::new(Notify::new());
-            let shutdown_udp_listener = shutdown.clone();
-            let shutdown_main = shutdown.clone();
-
-            let udp_recv = udp.clone();
-            let client_src_clone = client_src.clone();
-            // --- 任务 A: 接收本地 UDP 数据 -> 写入 TLS ---
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 65535];
-                loop {
-                    let result = select! {
-                        _ = shutdown_udp_listener.notified() => break,
-                        res = udp_recv.recv_from(&mut buf) => res,
-                    };
-                    if let Ok((n, src_addr)) = result {
-                        *client_src_clone.lock().await = Some(src_addr);
-                        if n == 0 {
-                            break;
-                        }
-
-                        if let Ok((addr, cursor)) = socks5::parse_udp_packet(&buf[..n]) {
-                            let udp_frame = build_udp_frame(&addr, &buf[cursor..n]);
-                            match udp_frame {
-                                Ok(frame) => {
-                                    if let Err(e) = tls_w.write_all(&frame).await {
-                                        error!("Client write udp to proxy server error: {}", e);
-                                        break;
-                                    }
-                                    add_upload(n);
-                                }
-                                Err(e) => {
-                                    error!("Failed to build UDP frame: {}", e);
-                                }
-                            }
-                        } else {
-                            error!("parse udp packet failed");
-                        };
-                    } else {
-                        error!("Client read udp from local error");
-                        break; // UDP 读取错误
-                    }
-                }
-                shutdown_udp_listener.notify_waiters();
-            });
-
-            // --- 任务 B (主线程): 接收 TLS 数据 -> 转发回本地 UDP ---
-            let udp_send = udp.clone();
-
-            loop {
-                select! {
-                    _ = shutdown_main.notified() => break,
-                    res = read_udp_frame(&mut tls_r) => {
-                        match res {
-                            Ok((addr,payload)) => {
-                                let target = { *client_src.lock().await };
-                                if let Some(src) = target {
-                                    match build_udp_packet(&addr, &payload) {
-                                        Ok(packet) => {
-                                            if let Err(e) = udp_send.send_to(&packet, src).await{
-                                                error!("Client write udp to local error: {}", e);
-                                                break;
-                                            }
-                                            add_download(payload.len());
-                                        }
-                                        Err(e) => {
-                                            error!("Failed to build UDP packet: {}", e);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!("read udp frame error {}", e);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            // 错误或连接关闭，通知其他任务退出
-            shutdown_main.notify_waiters();
+            relay_udp(local, udp, tls_r, tls_w).await?;
         }
     }
+    Ok(())
+}
+
+/// SOCKS5 UDP 关联：本地 UDP <-> TLS 隧道
+///
+/// - 只接受来自发起 UDP ASSOCIATE 的那个客户端 IP 的数据包，避免成为局域网开放中继
+/// - 控制用的 TCP 连接关闭时结束关联 (RFC 1928)
+/// - 任意方向结束都会拆除整个关联
+async fn relay_udp<R, W>(
+    mut control: TcpStream,
+    udp: tokio::net::UdpSocket,
+    mut tls_r: R,
+    mut tls_w: W,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let allowed_ip = get_canonical_ip(control.peer_addr()?.ip());
+    // 本地应用的来源地址 (IP:Port)：收到它的包就更新，服务端回包发往这里
+    let client_src = Mutex::new(None::<SocketAddr>);
+    let cancel = CancellationToken::new();
+
+    // 本地 UDP -> TLS
+    let uplink = async {
+        let mut buf = vec![0u8; UDP_BUFFER_SIZE];
+        let mut frame = Vec::with_capacity(UDP_BUFFER_SIZE + 32);
+        loop {
+            let (n, src_addr) = match udp.recv_from(&mut buf).await {
+                Ok(res) => res,
+                // Windows 下先前向不可达端口发送 UDP 后，下次 recv_from 会收到 ConnectionReset
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
+                Err(e) => {
+                    error!("Client read udp from local error: {}", e);
+                    break;
+                }
+            };
+            if get_canonical_ip(src_addr.ip()) != allowed_ip {
+                debug!("Drop udp packet from unexpected source {}", src_addr);
+                continue;
+            }
+            *client_src.lock().unwrap_or_else(|e| e.into_inner()) = Some(src_addr);
+
+            let (addr, offset) = match socks5::parse_udp_packet(&buf[..n]) {
+                Ok(res) => res,
+                Err(e) => {
+                    error!("parse udp packet failed: {}", e);
+                    continue;
+                }
+            };
+            frame.clear();
+            if let Err(e) = encode_udp_frame(&addr, &buf[offset..n], &mut frame) {
+                error!("Failed to build UDP frame: {}", e);
+                continue;
+            }
+            if let Err(e) = write_and_flush(&mut tls_w, &frame).await {
+                error!("Client write udp to proxy server error: {}", e);
+                break;
+            }
+            add_upload(n);
+        }
+    };
+
+    // TLS -> 本地 UDP
+    let downlink = async {
+        let mut packet = Vec::with_capacity(UDP_BUFFER_SIZE + 32);
+        loop {
+            let (addr, payload): (NetAddr, _) = match read_udp_frame(&mut tls_r).await {
+                Ok(frame) => frame,
+                Err(e) => {
+                    error!("read udp frame error {}", e);
+                    break;
+                }
+            };
+            let target = *client_src.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(dst) = target else {
+                continue;
+            };
+            packet.clear();
+            if let Err(e) = socks5::encode_udp_packet(&addr, &payload, &mut packet) {
+                error!("Failed to build UDP packet: {}", e);
+                continue;
+            }
+            if let Err(e) = udp.send_to(&packet, dst).await {
+                error!("Client write udp to local error: {}", e);
+                break;
+            }
+            add_download(payload.len());
+        }
+    };
+
+    // 控制连接：对端关闭或出错即结束关联
+    let control_watch = async {
+        let mut buf = [0u8; 64];
+        while let Ok(n) = control.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+        }
+    };
+
+    tokio::join!(
+        async {
+            cancel.run_until_cancelled(uplink).await;
+            cancel.cancel();
+        },
+        async {
+            cancel.run_until_cancelled(downlink).await;
+            cancel.cancel();
+        },
+        async {
+            cancel.run_until_cancelled(control_watch).await;
+            cancel.cancel();
+        },
+    );
     Ok(())
 }

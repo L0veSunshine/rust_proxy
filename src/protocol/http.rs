@@ -6,7 +6,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 pub enum HttpRequest {
-    Connect(NetAddr),
+    /// CONNECT 目标，以及客户端在请求头之后已经发来的数据（如提前发出的 TLS ClientHello）
+    Connect(NetAddr, Vec<u8>),
     Http(NetAddr, Vec<u8>),
 }
 
@@ -56,7 +57,7 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<HttpRequest> {
     let mut n = 0;
 
     // 读取头部，直到找到空行
-    loop {
+    let headers_end = loop {
         let read = stream.read(&mut buf[n..]).await?;
         if read == 0 {
             bail!("Unexpected EOF during HTTP handshake");
@@ -75,14 +76,14 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<HttpRequest> {
                     .map(|p| p + 2)
             });
 
-        if headers_end.is_some() {
-            break; // 找到头部结束，停止读取
+        if let Some(end) = headers_end {
+            break end; // 找到头部结束，停止读取
         }
 
         if n == buf.len() {
             bail!("Header too large");
         }
-    }
+    };
 
     // 解析第一行
     let first_line_end = buf[..n]
@@ -99,7 +100,7 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<HttpRequest> {
 
     if method == "CONNECT" {
         let addr = parse_target(target, 443)?;
-        Ok(HttpRequest::Connect(addr))
+        Ok(HttpRequest::Connect(addr, buf[headers_end..n].to_vec()))
     } else {
         let addr = parse_target(target, 80)?;
         Ok(HttpRequest::Http(addr, buf[0..n].to_vec()))

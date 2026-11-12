@@ -1,17 +1,23 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::sync::Notify;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+
+/// 默认优雅关闭超时时间
+pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+/// 超时后强制取消连接，再额外等待它们退出的时间
+pub const FORCE_CLOSE_GRACE: Duration = Duration::from_secs(1);
 
 /// 优雅关闭管理器
 #[derive(Clone)]
 pub struct GracefulShutdown {
-    /// 关闭信号
-    shutdown_signal: Arc<Notify>,
-    /// 是否正在关闭
-    is_shutting_down: Arc<AtomicBool>,
+    /// 关闭信号（停止接受新连接）。CancellationToken 触发后状态会一直保持，
+    /// 晚于触发才开始等待的任务也能立即感知，不会像 `Notify::notify_waiters` 那样丢通知。
+    shutdown_signal: CancellationToken,
+    /// 强制关闭现有连接的信号
+    connections_signal: CancellationToken,
     /// 活跃连接数
     active_connections: Arc<AtomicUsize>,
 }
@@ -20,27 +26,31 @@ impl GracefulShutdown {
     /// 创建优雅关闭管理器
     pub fn new() -> Self {
         Self {
-            shutdown_signal: Arc::new(Notify::new()),
-            is_shutting_down: Arc::new(AtomicBool::new(false)),
+            shutdown_signal: CancellationToken::new(),
+            connections_signal: CancellationToken::new(),
             active_connections: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     /// 等待关闭信号
     pub async fn wait_shutdown(&self) {
-        self.shutdown_signal.notified().await;
+        self.shutdown_signal.cancelled().await;
     }
 
     /// 检查是否正在关闭
     pub fn is_shutting_down(&self) -> bool {
-        self.is_shutting_down.load(Ordering::Relaxed)
+        self.shutdown_signal.is_cancelled()
     }
 
     /// 触发关闭信号
     pub fn trigger_shutdown(&self) {
         info!("Triggering graceful shutdown");
-        self.is_shutting_down.store(true, Ordering::Release);
-        self.shutdown_signal.notify_waiters();
+        self.shutdown_signal.cancel();
+    }
+
+    /// 每条连接持有一个子 token：优雅关闭超时后会被统一取消
+    pub fn connection_token(&self) -> CancellationToken {
+        self.connections_signal.child_token()
     }
 
     /// 增加活跃连接数
@@ -61,7 +71,7 @@ impl GracefulShutdown {
     /// 执行优雅关闭流程
     ///
     /// # Arguments
-    /// * `timeout_duration` - 等待现有连接完成的最大时间
+    /// * `timeout_duration` - 等待现有连接自然结束的最大时间；超时后强制取消剩余连接
     pub async fn shutdown(&self, timeout_duration: Duration) {
         info!("Starting graceful shutdown");
 
@@ -69,27 +79,39 @@ impl GracefulShutdown {
         self.trigger_shutdown();
 
         // 2. 等待现有连接完成
-        let result = timeout(timeout_duration, async {
-            while self.active_connections() > 0 {
-                let count = self.active_connections();
-                info!("Waiting for {} active connections to complete", count);
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-        })
-        .await;
-
-        match result {
-            Ok(_) => info!("All connections completed gracefully"),
-            Err(_) => {
-                let remaining = self.active_connections();
+        if self.wait_connections(timeout_duration).await {
+            info!("All connections completed gracefully");
+        } else {
+            // 3. 超时：通知剩余连接立即退出，并给它们一点时间释放资源
+            warn!(
+                "Shutdown timeout reached, force closing {} active connections",
+                self.active_connections()
+            );
+            self.connections_signal.cancel();
+            if !self.wait_connections(FORCE_CLOSE_GRACE).await {
                 warn!(
-                    "Shutdown timeout reached, {} connections still active",
-                    remaining
+                    "{} connections still active after force close",
+                    self.active_connections()
                 );
             }
         }
 
         info!("Graceful shutdown completed");
+    }
+
+    /// 等待活跃连接归零，返回是否在超时前完成
+    async fn wait_connections(&self, timeout_duration: Duration) -> bool {
+        timeout(timeout_duration, async {
+            while self.active_connections() > 0 {
+                info!(
+                    "Waiting for {} active connections to complete",
+                    self.active_connections()
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .is_ok()
     }
 }
 
@@ -252,16 +274,28 @@ mod tests {
     #[tokio::test]
     async fn test_shutdown_timeout() {
         let shutdown = GracefulShutdown::new();
+        let conn_token = shutdown.connection_token();
 
         // 模拟一个不会结束的连接
         shutdown.increment_connections();
 
-        // 关闭应该在超时后返回
+        // 关闭应该在超时 + 强制关闭宽限期后返回，并取消剩余连接
         let start = std::time::Instant::now();
         shutdown.shutdown(Duration::from_millis(100)).await;
         let elapsed = start.elapsed();
 
-        assert!(elapsed >= Duration::from_millis(100));
-        assert!(elapsed < Duration::from_millis(200));
+        assert!(conn_token.is_cancelled());
+        assert!(elapsed >= Duration::from_millis(100) + FORCE_CLOSE_GRACE);
+        assert!(elapsed < Duration::from_millis(500) + FORCE_CLOSE_GRACE);
+    }
+
+    #[tokio::test]
+    async fn test_wait_after_trigger_returns_immediately() {
+        // 先触发、后等待也必须能收到信号（Notify::notify_waiters 做不到）
+        let shutdown = GracefulShutdown::new();
+        shutdown.trigger_shutdown();
+        timeout(Duration::from_millis(100), shutdown.wait_shutdown())
+            .await
+            .expect("wait_shutdown should return after trigger");
     }
 }

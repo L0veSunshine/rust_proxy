@@ -340,18 +340,21 @@ sudo systemctl start rust-proxy-server
 
 **主要特性：**
 - TOTP 动态 UUID 认证（基于时间戳）
-- 随机 Padding（16-128 字节）实现流量混淆
+- 随机 Padding（高斯分布，16-600 字节）实现流量混淆
 - 支持 IPv4/IPv6/域名地址
 - 0-RTT 握手优化
 
 ## 🧪 测试
 
 ```bash
-# 运行所有测试
+# 运行所有测试（含 tests/e2e.rs 端到端测试：SOCKS5 TCP/UDP、HTTP CONNECT、IPv6 目标）
 cargo test
 
 # 运行特定模块测试
 cargo test --lib protocol
+
+# 只运行端到端测试
+cargo test --test e2e
 
 # 详细输出
 cargo test -- --nocapture

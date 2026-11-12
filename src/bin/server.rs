@@ -5,7 +5,9 @@ use rust_proxy::api::server::start_admin_api;
 use rust_proxy::config::ServerConfig;
 use rust_proxy::connection_pool::ConnectionPool;
 use rust_proxy::health::SystemMetrics;
-use rust_proxy::shutdown::{GracefulShutdown, setup_signal_handler};
+use rust_proxy::shutdown::{
+    DEFAULT_SHUTDOWN_TIMEOUT, FORCE_CLOSE_GRACE, GracefulShutdown, setup_signal_handler,
+};
 use rust_proxy::user_manager::UserManager;
 use rust_proxy::{init_logger, server};
 use std::sync::Arc;
@@ -225,9 +227,13 @@ async fn stop_server(config_path: &str, pid_file: &str) -> Result<()> {
             .output();
     }
 
-    // 3. 轮询等待进程优雅退出（最多等待 10 秒）
+    // 3. 轮询等待进程优雅退出（需覆盖服务端的优雅关闭超时 + 强制取消宽限期）
+    let stop_wait_timeout = DEFAULT_SHUTDOWN_TIMEOUT
+        .saturating_add(FORCE_CLOSE_GRACE)
+        .saturating_add(Duration::from_secs(4));
+    let deadline = tokio::time::Instant::now() + stop_wait_timeout;
     let mut exited = false;
-    for _ in 0..50 {
+    while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(200)).await;
         if !is_process_alive(pid) {
             exited = true;
@@ -239,7 +245,10 @@ async fn stop_server(config_path: &str, pid_file: &str) -> Result<()> {
         let _ = std::fs::remove_file(pid_file);
         println!("[+] 服务已优雅退出 (PID: {})。", pid);
     } else {
-        println!("[!] 服务在 10 秒内未完全退出，正在执行强制终止...");
+        println!(
+            "[!] 服务在 {} 秒内未完全退出，正在执行强制终止...",
+            stop_wait_timeout.as_secs()
+        );
         #[cfg(windows)]
         {
             let _ = std::process::Command::new("taskkill")
@@ -429,7 +438,7 @@ async fn run_server(config_path: &str, pid_file: &str, is_daemon: bool) -> Resul
 
     // 执行优雅关闭
     tracing::info!("Shutting down gracefully...");
-    shutdown.shutdown(Duration::from_secs(30)).await;
+    shutdown.shutdown(DEFAULT_SHUTDOWN_TIMEOUT).await;
 
     // 清理 PID 文件
     if is_daemon {
