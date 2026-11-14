@@ -1,17 +1,30 @@
-use crate::protocol::net_addr::{ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, NetAddr};
+use crate::protocol::net_addr::NetAddr;
 use crate::protocol::utils::generate_gaussian_padding;
 use crate::protocol::var_int::{encode_varint, read_varint};
 use anyhow::{Result, anyhow};
 use bytes::{Bytes, BytesMut};
 use std::io;
 use std::io::{Error, ErrorKind};
-use std::net::{Ipv4Addr, Ipv6Addr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
 pub const MESSAGE_VERSION: u8 = 0x01;
 
 pub const TYPE: u8 = 0x01;
+
+/// Client Hello 的 Padding 长度分布：N(360, 60²)，并截断到 [16, 600]。
+///
+/// 上限保证 "Header(19) + 最长地址(258) + PadLen(2) + Padding" 不超过
+/// 服务端 1024 字节的握手缓冲区。
+const HELLO_PADDING_MEAN: f64 = 360.0;
+const HELLO_PADDING_STD_DEV: f64 = 60.0;
+pub const HELLO_PADDING_MIN: u16 = 16;
+pub const HELLO_PADDING_MAX: u16 = 600;
+
+/// Server Response 的 Padding 长度分布：N(150, 25²)，截断到 [0, 254]（Length 字段为 1 字节）
+const RESPONSE_PADDING_MEAN: f64 = 150.0;
+const RESPONSE_PADDING_STD_DEV: f64 = 25.0;
+const RESPONSE_PADDING_MAX: u16 = 254;
 
 #[derive(Debug, Copy, Clone)]
 pub enum Command {
@@ -37,10 +50,28 @@ impl TryFrom<u8> for Command {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Response {
     Success = 0x01,
     Rejected = 0x02,
+    HostUnreachable = 0x03,
+    ConnectionRefused = 0x04,
+    TimedOut = 0x05,
+}
+
+impl Response {
+    /// 将服务端连接目标时的 I/O 错误映射为协议状态码
+    pub fn from_io_error(err: &io::Error) -> Self {
+        match err.kind() {
+            ErrorKind::ConnectionRefused => Response::ConnectionRefused,
+            ErrorKind::TimedOut => Response::TimedOut,
+            ErrorKind::NotFound
+            | ErrorKind::HostUnreachable
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::AddrNotAvailable => Response::HostUnreachable,
+            _ => Response::Rejected,
+        }
+    }
 }
 
 impl From<Response> for u8 {
@@ -55,6 +86,9 @@ impl TryFrom<u8> for Response {
         match value {
             0x01 => Ok(Response::Success),
             0x02 => Ok(Response::Rejected),
+            0x03 => Ok(Response::HostUnreachable),
+            0x04 => Ok(Response::ConnectionRefused),
+            0x05 => Ok(Response::TimedOut),
             _ => Err(Error::new(ErrorKind::InvalidInput, "Unknown response")),
         }
     }
@@ -69,21 +103,46 @@ pub async fn client_hello<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    client_hello_with_payload(stream, user_token, cmd, addr, &[]).await
+}
+
+/// 将握手头与可选的 0-RTT 初始载荷一次性拼包写出，避免拆成多个 TLS record。
+pub async fn client_hello_with_payload<W>(
+    stream: &mut W,
+    user_token: &Uuid,
+    cmd: &Command,
+    addr: &NetAddr,
+    initial_payload: &[u8],
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let pad_len = generate_gaussian_padding(
+        HELLO_PADDING_MEAN,
+        HELLO_PADDING_STD_DEV,
+        HELLO_PADDING_MIN,
+        HELLO_PADDING_MAX,
+    );
+
+    let mut buf = Vec::with_capacity(
+        16 + 3 + addr.bytes_len() + 2 + pad_len as usize + initial_payload.len(),
+    );
     // 1. Header
-    stream.write_all(user_token.as_bytes()).await?; // Token
-    stream.write_u8(MESSAGE_VERSION).await?; // Ver
-    stream.write_u8(TYPE).await?; // Type
-    stream.write_u8(u8::from(*cmd)).await?; // Cmd
-
+    buf.extend_from_slice(user_token.as_bytes()); // Token
+    buf.push(MESSAGE_VERSION); // Ver
+    buf.push(TYPE); // Type
+    buf.push(u8::from(*cmd)); // Cmd
     // 2. Target Address
-    addr.write_to(stream).await?;
-
+    addr.write_to_buf(&mut buf)?;
     // 3. Random Padding
-    let pad_len = generate_gaussian_padding(360.0, 60.0); // 16-255
-    stream.write_u16(pad_len).await?;
+    buf.extend_from_slice(&pad_len.to_be_bytes());
+    buf.resize(buf.len() + pad_len as usize, 0);
+    // 4. Optional 0-RTT Payload
+    if !initial_payload.is_empty() {
+        buf.extend_from_slice(initial_payload);
+    }
 
-    let padding = vec![0u8; pad_len as usize];
-    stream.write_all(&padding).await?;
+    stream.write_all(&buf).await?;
     stream.flush().await?;
     Ok(())
 }
@@ -106,8 +165,14 @@ where
     let cmd = stream.read_u8().await?.try_into()?;
     let addr = NetAddr::read_from(stream).await?;
 
-    // 读 Padding 长度
+    // 读 Padding 长度并校验上限，防止非本协议流量因超大长度字段一直等待读满缓冲区
     let pad_len = stream.read_u16().await?;
+    if pad_len > HELLO_PADDING_MAX {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Client hello padding exceeds limit",
+        ));
+    }
 
     // 跳过 Padding
     if pad_len > 0 {
@@ -128,18 +193,18 @@ pub async fn response_to_client<W>(stream: &mut W, status: &Response) -> Result<
 where
     W: AsyncWrite + Unpin,
 {
-    let random_len = generate_gaussian_padding(150.0, 25.0).clamp(0, 254) as u8;
-    stream.write_u8(random_len + 1).await?;
-    stream.write_u8((*status).into()).await?;
-    let padding_buf = [0u8; 255];
-    stream
-        .write_all(&padding_buf[..random_len as usize])
-        .await?;
+    let random_len = generate_gaussian_padding(
+        RESPONSE_PADDING_MEAN,
+        RESPONSE_PADDING_STD_DEV,
+        0,
+        RESPONSE_PADDING_MAX,
+    ) as usize;
+    let mut buf = [0u8; 2 + RESPONSE_PADDING_MAX as usize];
+    buf[0] = random_len as u8 + 1;
+    buf[1] = (*status).into();
+    stream.write_all(&buf[..2 + random_len]).await?;
     stream.flush().await?;
-    match status {
-        Response::Success => Ok(()),
-        _ => Err(anyhow!("Unauthorized")),
-    }
+    Ok(())
 }
 
 pub async fn read_response_from_server<R>(stream: &mut R) -> Result<u8>
@@ -147,33 +212,39 @@ where
     R: AsyncRead + Unpin,
 {
     let length = stream.read_u8().await?;
+    // Length 至少要包含 Status 自身
+    let padding_length = length
+        .checked_sub(1)
+        .ok_or_else(|| anyhow!("Invalid server response length: 0"))?;
     let status = stream.read_u8().await?;
-    let padding_length = length as usize - 1;
     let mut limiter = stream.take(padding_length as u64);
-    let mut sink = tokio::io::sink();
-    tokio::io::copy(&mut limiter, &mut sink).await?;
+    let consumed = tokio::io::copy(&mut limiter, &mut tokio::io::sink()).await?;
+    if consumed < padding_length as u64 {
+        return Err(Error::from(ErrorKind::UnexpectedEof).into());
+    }
     Ok(status)
 }
 
-pub fn build_udp_frame(addr: &NetAddr, payload: &[u8]) -> io::Result<Vec<u8>> {
-    // 计算 Body Len
+/// 把 UDP 帧追加编码到 `frame`：VarInt(BodyLen) + Addr + Payload
+///
+/// 调用方可复用同一个 Vec，避免每个包都分配内存。
+pub fn encode_udp_frame(addr: &NetAddr, payload: &[u8], frame: &mut Vec<u8>) -> io::Result<()> {
     let body_len = addr.bytes_len() + payload.len();
 
-    // UDP 长度字段是 u16，检查溢出
+    // 长度字段最多表示 u16
     if body_len > u16::MAX as usize {
         return Err(Error::new(ErrorKind::InvalidInput, "UDP frame too large"));
     };
-    // 构建最终帧
-    // 总容量 = 2 (Length) + Addr + Payload
-    let mut frame = Vec::with_capacity(3 + body_len);
-
-    // 写入长度
-    encode_varint(body_len as u16, &mut frame);
-    // 写入地址
-    addr.write_to_buf(&mut frame);
-    // 写入 Payload
+    frame.reserve(3 + body_len);
+    encode_varint(body_len as u16, frame);
+    addr.write_to_buf(frame)?;
     frame.extend_from_slice(payload);
+    Ok(())
+}
 
+pub fn build_udp_frame(addr: &NetAddr, payload: &[u8]) -> io::Result<Vec<u8>> {
+    let mut frame = Vec::new();
+    encode_udp_frame(addr, payload, &mut frame)?;
     Ok(frame)
 }
 
@@ -181,7 +252,7 @@ pub async fn read_udp_frame<R>(stream: &mut R) -> io::Result<(NetAddr, Bytes)>
 where
     R: AsyncRead + Unpin,
 {
-    // 1. 读取 Body Len (2 字节)
+    // 1. 读取 Body Len
     let body_len = read_varint(stream).await? as usize;
 
     if body_len == 0 {
@@ -192,117 +263,18 @@ where
     let mut body = BytesMut::zeroed(body_len);
     stream.read_exact(&mut body).await?;
 
-    // 3. 从 Body 头部解析 NetAddr
-    let (addr, consumed_len) = parse_addr(&body)?;
-
-    // 4. 截取 Payload
-    // 剩下的部分就是 Payload
-    if consumed_len > body_len {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "Parsed address exceeds body length",
-        ));
-    }
-
-    // 使用 to_vec() 将切片转换为 Vec<u8>
+    // 3. 从 Body 头部解析 NetAddr，剩下的部分就是 Payload
+    let (addr, consumed_len) = NetAddr::parse(&body)?;
     let payload = body.freeze().slice(consumed_len..);
 
     Ok((addr, payload))
-}
-
-/// 解析地址部分: ATYP(1) + Addr(Var) + Port(2)
-pub fn parse_addr(data: &[u8]) -> io::Result<(NetAddr, usize)> {
-    if data.is_empty() {
-        return Err(Error::new(ErrorKind::InvalidInput, "Data too short"));
-    }
-
-    let atyp = data[0];
-    let mut cursor = 1;
-    match atyp {
-        ATYP_IPV4 => {
-            // 校验长度: 当前cursor + IPv4(4) + Port(2)
-            if data.len() < cursor + 4 + 2 {
-                return Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    "Invalid IPv4 packet: data too short",
-                ));
-            }
-
-            let bytes: [u8; 4] = data[cursor..cursor + 4]
-                .try_into()
-                .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid IPv4 addr"))?; // 长度已校验，unwrap 安全
-            let ip = Ipv4Addr::from(bytes);
-            cursor += 4;
-
-            // 读取端口
-            let port = u16::from_be_bytes([data[cursor], data[cursor + 1]]);
-            cursor += 2;
-
-            Ok((NetAddr::V4(ip, port), cursor))
-        }
-        ATYP_DOMAIN => {
-            // 校验长度: 读取 len 字节
-            if data.len() <= cursor {
-                return Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    "Invalid Domain packet: missing length byte",
-                ));
-            }
-
-            let len = data[cursor] as usize;
-            cursor += 1;
-
-            // 校验长度: 域名内容(len) + Port(2)
-            if data.len() < cursor + len + 2 {
-                return Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    "Invalid Domain packet: data too short",
-                ));
-            }
-
-            // 转换域名
-            let domain_bytes = &data[cursor..cursor + len];
-            let domain = String::from_utf8(domain_bytes.to_vec())
-                .map_err(|_| Error::new(ErrorKind::InvalidInput, "Invalid Domain encoding"))?;
-            cursor += len;
-
-            // 读取端口
-            let port = u16::from_be_bytes([data[cursor], data[cursor + 1]]);
-            cursor += 2;
-
-            Ok((NetAddr::Domain(domain, port), cursor))
-        }
-        ATYP_IPV6 => {
-            // 校验长度: IPv6(16) + Port(2)
-            if data.len() < cursor + 16 + 2 {
-                return Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    "Invalid IPv6 packet: data too short",
-                ));
-            }
-
-            let bytes: [u8; 16] = data[cursor..cursor + 16]
-                .try_into()
-                .map_err(|_| Error::new(ErrorKind::InvalidData, "Invalid IPv6 addr"))?;
-            let ip = Ipv6Addr::from(bytes);
-            cursor += 16;
-
-            let port = u16::from_be_bytes([data[cursor], data[cursor + 1]]);
-            cursor += 2;
-
-            Ok((NetAddr::V6(ip, port), cursor))
-        }
-        _ => Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("Unsupported ATYP: {}", atyp),
-        )),
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::net::Ipv4Addr;
 
     #[tokio::test]
     async fn test_read_udp_frame_zero_copy() {
@@ -337,5 +309,29 @@ mod tests {
         assert_eq!(frame[0], 12); // body_len
         assert_eq!(frame[1], 0x01); // ATYP
         assert_eq!(&frame[8..], b"Hello"); // payload
+    }
+
+    #[tokio::test]
+    async fn test_zero_length_response_is_rejected() {
+        let mut cursor = Cursor::new(vec![0u8, 0x01]);
+        assert!(read_response_from_server(&mut cursor).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_client_hello_roundtrip() {
+        let token = Uuid::new_v4();
+        let addr = NetAddr::Domain("a".repeat(255), 443);
+        let mut buf = Vec::new();
+        client_hello(&mut buf, &token, &Command::UdpAssociate, &addr)
+            .await
+            .unwrap();
+        // 最长地址 + 最大 Padding 也必须放进服务端 1024 字节的握手缓冲区
+        assert!(buf.len() <= 16 + 3 + addr.bytes_len() + 2 + HELLO_PADDING_MAX as usize);
+        assert!(buf.len() <= 1024);
+
+        let (t, cmd, a) = read_client_request(&mut Cursor::new(buf)).await.unwrap();
+        assert_eq!(t, token);
+        assert!(matches!(cmd, Command::UdpAssociate));
+        assert_eq!(a, addr);
     }
 }

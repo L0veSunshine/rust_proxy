@@ -11,6 +11,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::IpAddr;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::info;
@@ -77,11 +78,58 @@ pub struct UserProfile {
     pub rate_limit: u64,
 }
 
+/// 对外展示的用户信息（不含密钥）
+#[derive(Clone, Debug)]
+pub struct UserSummary {
+    pub key_id: [u8; 4],
+    pub max_ip: u32,
+    pub rate_limit: u64,
+}
+
+/// 用户级限速器（字节/秒）
+///
+/// governor 单次申请的令牌数不能超过 burst（= 每秒速率），否则直接返回
+/// `InsufficientCapacity` 而不等待。这里把大块数据按 burst 拆开申请，
+/// 保证任意大小的读写都会被真正限速。
+pub struct UserLimiter {
+    inner: DefaultDirectRateLimiter,
+    burst: NonZeroU32,
+}
+
+impl UserLimiter {
+    /// `rate_limit` 为 0 表示不限速；超过 u32 的值按 u32::MAX 处理
+    pub fn new(rate_limit: u64) -> Option<Self> {
+        let rate = NonZeroU32::new(u32::try_from(rate_limit).unwrap_or(u32::MAX))?;
+        Some(Self {
+            inner: RateLimiter::direct(Quota::per_second(rate)),
+            burst: rate,
+        })
+    }
+
+    /// 单次突发上限（字节），也是平滑限速时建议的单次最大读取块大小
+    pub fn burst(&self) -> usize {
+        self.burst.get() as usize
+    }
+
+    /// 等待直到可以发送 `bytes` 字节
+    pub async fn consume(&self, bytes: usize) {
+        let mut remaining = bytes;
+        while remaining > 0 {
+            let chunk = remaining.min(self.burst.get() as usize);
+            if let Some(n) = NonZeroU32::new(chunk as u32) {
+                // chunk <= burst，不会出现 InsufficientCapacity
+                let _ = self.inner.until_n_ready(n).await;
+            }
+            remaining -= chunk;
+        }
+    }
+}
+
 pub struct UserManager {
     db: Database,
     pub cache: Arc<DashMap<[u8; 4], UserProfile>>,
     pub ip_tracker: Arc<DashMap<[u8; 4], DashMap<IpAddr, u32>>>,
-    pub limiters: Arc<DashMap<[u8; 4], Arc<DefaultDirectRateLimiter>>>,
+    pub limiters: Arc<DashMap<[u8; 4], Arc<UserLimiter>>>,
 }
 
 // 定义 IP 守卫
@@ -162,51 +210,33 @@ impl UserManager {
     }
 
     pub fn leave_ip(&self, key_id: [u8; 4], ip: IpAddr) {
-        // 使用 entry API 或检查逻辑
         if let Some(user_ips) = self.ip_tracker.get(&key_id) {
-            let mut should_remove_user_entirely = false;
-
-            if let Some(mut count) = user_ips.get_mut(&ip) {
-                if *count > 1 {
-                    *count -= 1;
-                } else {
-                    // 当前 IP 的最后一个连接断开了
-                    drop(count); // 先释放内层锁
-                    user_ips.remove(&ip);
-
-                    // 检查这个用户是否已经没有任何活跃 IP 了
-                    if user_ips.is_empty() {
-                        should_remove_user_entirely = true;
-                    }
-                }
-            }
-
-            if should_remove_user_entirely {
-                drop(user_ips); // 释放外层读锁
-                self.ip_tracker.remove(&key_id);
-                tracing::debug!("User {:x?} 活跃 IP 已归零，清理追踪器存根", key_id);
-            }
+            // 在同一把锁内完成"减一并判断是否归零"，避免与并发的 enter_ip 交错
+            user_ips.remove_if_mut(&ip, |_, count| {
+                *count = count.saturating_sub(1);
+                *count == 0
+            });
+        }
+        // 必须在释放上面的读引用之后再拿写锁，否则同一分片会死锁。
+        // remove_if 在写锁内重新检查是否为空：期间若有新连接登记了 IP，就不会被误删。
+        if self
+            .ip_tracker
+            .remove_if(&key_id, |_, ips| ips.is_empty())
+            .is_some()
+        {
+            tracing::debug!("User {:x?} 活跃 IP 已归零，清理追踪器存根", key_id);
         }
     }
 
-    pub fn get_user_limiter(
-        &self,
-        key_id: [u8; 4],
-        rate_limit: u64,
-    ) -> Option<Arc<DefaultDirectRateLimiter>> {
-        if rate_limit == 0 {
-            return None;
+    pub fn get_user_limiter(&self, key_id: [u8; 4], rate_limit: u64) -> Option<Arc<UserLimiter>> {
+        if let Some(limiter) = self.limiters.get(&key_id) {
+            return Some(limiter.clone());
         }
-
-        // 如果该用户的限速器已存在，直接返回；否则创建一个新的
+        let limiter = Arc::new(UserLimiter::new(rate_limit)?);
         Some(
             self.limiters
                 .entry(key_id)
-                .or_insert_with(|| {
-                    let quota =
-                        Quota::per_second(std::num::NonZeroU32::new(rate_limit as u32).unwrap());
-                    Arc::new(RateLimiter::direct(quota))
-                })
+                .or_insert(limiter)
                 .value()
                 .clone(),
         )
@@ -232,27 +262,27 @@ impl UserManager {
     }
 
     // [查] 获取单个用户
-    pub fn get_user(&self, key_id: [u8; 4]) -> ServiceResult<UserProfile> {
+    pub fn get_user(&self, key_id: [u8; 4]) -> ServiceResult<UserSummary> {
         self.cache
             .get(&key_id)
-            .map(|kv| UserProfile {
-                secret: key_id.to_vec(),
-                max_ip: kv.max_ip,
-                rate_limit: kv.rate_limit,
+            .map(|user| UserSummary {
+                key_id,
+                max_ip: user.max_ip,
+                rate_limit: user.rate_limit,
             })
             .ok_or_else(|| ServiceError::UserNotFound(hex::encode(key_id)))
     }
 
-    pub fn get_all_users(&self) -> ServiceResult<Vec<UserProfile>> {
+    pub fn get_all_users(&self) -> ServiceResult<Vec<UserSummary>> {
         let users = self
             .cache
             .iter()
-            .map(|k| UserProfile {
-                secret: k.key().to_vec(),
+            .map(|k| UserSummary {
+                key_id: *k.key(),
                 max_ip: k.max_ip,
                 rate_limit: k.rate_limit,
             })
-            .collect::<Vec<UserProfile>>();
+            .collect();
         Ok(users)
     }
 
@@ -359,5 +389,52 @@ impl UserManager {
             self.cache.insert(*key.value(), profile);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn test_limiter_throttles_chunks_larger_than_burst() {
+        // 以前单次申请超过 burst 会直接返回错误并被忽略，等于不限速
+        let limiter = UserLimiter::new(4000).unwrap();
+        let start = Instant::now();
+        limiter.consume(6000).await;
+        assert!(start.elapsed() >= Duration::from_millis(400));
+    }
+
+    #[test]
+    fn test_limiter_handles_huge_rate() {
+        // 以前 rate as u32 截断为 0 后 unwrap 会 panic
+        assert!(UserLimiter::new(1u64 << 32).is_some());
+        assert!(UserLimiter::new(0).is_none());
+    }
+
+    #[test]
+    fn test_ip_tracking_counts_connections() {
+        let path = std::env::temp_dir().join(format!("rust_proxy_um_{}.db", Uuid::new_v4()));
+        let manager = Arc::new(UserManager::new(path.to_str().unwrap()).unwrap());
+        let key_id: [u8; 4] = hex::decode(manager.add_user(Uuid::new_v4(), 1, 0).unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let ip1: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip2: IpAddr = "10.0.0.2".parse().unwrap();
+
+        let g1 = manager.enter_ip(key_id, ip1).unwrap();
+        let g2 = manager.enter_ip(key_id, ip1).unwrap();
+        assert!(manager.enter_ip(key_id, ip2).is_err());
+
+        drop(g1);
+        assert!(manager.ip_tracker.contains_key(&key_id));
+        drop(g2);
+        assert!(!manager.ip_tracker.contains_key(&key_id));
+        assert!(manager.enter_ip(key_id, ip2).is_ok());
+
+        drop(manager);
+        let _ = std::fs::remove_file(path);
     }
 }

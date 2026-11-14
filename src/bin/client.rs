@@ -22,6 +22,12 @@ struct ClientCli {
     log_level: String,
     #[arg(long, default_value_t = client_log_rotate_size())]
     log_rotate_size: u64,
+    /// 关闭 0-RTT 模式，改为等待服务端确认连上目标后再向本地应用回复状态
+    #[arg(long, default_value_t = false)]
+    no_0rtt: bool,
+    /// 本地最大并发代理连接数（0 表示不限制）
+    #[arg(long, default_value_t = 4096)]
+    max_connections: usize,
 }
 
 default_value!(client_log_rotate_size, u64, 10 * 1024 * 1024);
@@ -42,6 +48,13 @@ async fn main() -> Result<()> {
         start_stat_api(cli.api_port).await;
     });
 
-    info!("Client will connect to remote {}", cli.remote);
-    client::run(cli.local, cli.remote, cli.ca_path, key_uuid).await
+    let options = client::ClientOptions {
+        zero_rtt: !cli.no_0rtt,
+        max_connections: cli.max_connections,
+    };
+    info!(
+        "Client will connect to remote {} (0-RTT: {}, max_connections: {})",
+        cli.remote, options.zero_rtt, options.max_connections
+    );
+    client::run(cli.local, cli.remote, cli.ca_path, key_uuid, options).await
 }

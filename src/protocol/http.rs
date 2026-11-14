@@ -1,18 +1,20 @@
 use crate::protocol::net_addr::NetAddr;
 use anyhow::{Result, anyhow, bail};
+use http::Uri;
 use std::net::IpAddr;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 pub enum HttpRequest {
-    Connect(NetAddr),
+    /// CONNECT 目标，以及客户端在请求头之后已经发来的数据（如提前发出的 TLS ClientHello）
+    Connect(NetAddr, Vec<u8>),
     Http(NetAddr, Vec<u8>),
 }
 
 /// 解析 host:port 格式的地址或 URI
 fn parse_target(target: &str, default_port: u16) -> Result<NetAddr> {
     // 1. 提取 host 和 port
-    let (host, port) = if let Ok(uri) = target.parse::<http::Uri>() {
+    let (host, port) = if let Ok(uri) = target.parse::<Uri>() {
         match uri.host() {
             // 情况 A: 成功解析为 URI
             Some(h) => (h.to_string(), uri.port_u16().unwrap_or(default_port)),
@@ -55,7 +57,7 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<HttpRequest> {
     let mut n = 0;
 
     // 读取头部，直到找到空行
-    loop {
+    let headers_end = loop {
         let read = stream.read(&mut buf[n..]).await?;
         if read == 0 {
             bail!("Unexpected EOF during HTTP handshake");
@@ -74,14 +76,14 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<HttpRequest> {
                     .map(|p| p + 2)
             });
 
-        if headers_end.is_some() {
-            break; // 找到头部结束，停止读取
+        if let Some(end) = headers_end {
+            break end; // 找到头部结束，停止读取
         }
 
         if n == buf.len() {
             bail!("Header too large");
         }
-    }
+    };
 
     // 解析第一行
     let first_line_end = buf[..n]
@@ -98,7 +100,7 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<HttpRequest> {
 
     if method == "CONNECT" {
         let addr = parse_target(target, 443)?;
-        Ok(HttpRequest::Connect(addr))
+        Ok(HttpRequest::Connect(addr, buf[headers_end..n].to_vec()))
     } else {
         let addr = parse_target(target, 80)?;
         Ok(HttpRequest::Http(addr, buf[0..n].to_vec()))
@@ -106,18 +108,26 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<HttpRequest> {
 }
 
 /// 发送 HTTP 200 Connection Established 响应；
-pub async fn send_connect_success(stream: &mut TcpStream) -> Result<()> {
+pub async fn send_connect_success<W>(stream: &mut W) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let response = b"HTTP/1.1 200 Connection Established\r\n\r\n";
     stream.write_all(response).await?;
+    stream.flush().await?;
     Ok(())
 }
 
 /// 发送 HTTP 错误响应
-pub async fn send_error(stream: &mut TcpStream, status_code: u16, message: &str) -> Result<()> {
+pub async fn send_error<W>(stream: &mut W, status_code: u16, message: &str) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let response = format!(
-        "HTTP/1.1 {} {}\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
         status_code, message
     );
     stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
     Ok(())
 }

@@ -4,36 +4,41 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.101"
-clap = { version = "4.5.58", features = ["derive"] }
-tokio = { version = "1.49.0", features = ["full"] }
-serde = { version = "1.0.228", features = ["derive", "rc"] }
-bytes = { version = "1.11.1", features = ["serde"] }
-rand = "0.10.0"
-rustls = { version = "0.23", default-features = false, features = ["logging", "std", "ring"] }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "ring"] }
-rustls-pemfile = "2.2.0"
-uuid = { version = "1.19.0", features = ["v4"] }
+anyhow = "1.0.104"
+clap = { version = "4.5.67", features = ["derive"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+bytes = { version = "1.12.1", features = ["serde"] }
+rand = "0.10.3"
+rustls = { version = "0.23.46", default-features = false, features = ["logging", "std", "ring"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["logging", "ring"] }
+uuid = { version = "1.29.2", features = ["v4"] }
 socket2 = "0.6.2"
-moka = { version = "0.12.13", features = ["future"] }
+moka = { version = "0.12.16", features = ["future"] }
 tracing = "0.1.44"
-tracing-subscriber = "0.3.22"
-tracing-appender = "0.2.4"
-chrono = "0.4.43"
-flate2 = "1.1.9"
-hmac = "0.12.1"
-sha2 = "0.10.9"
-serde_json = "1.0.149"
-dashmap = { version = "6.1.0", features = ["serde"] }
-toml = "1.0.0"
-thiserror = "2.0.18"
-axum = "0.8.8"
-http = "1.4.0"
-redb = "3.1.0"
+tracing-subscriber = "0.3.23"
+tracing-appender = "0.2.5"
+chrono = "0.4.45"
+flate2 = "1.1.11"
+hmac = "0.13.0"
+sha2 = "0.11.1"
+serde_json = "1.0.154"
+dashmap = { version = "6.2.1", features = ["serde"] }
+toml = "1.2.1"
+thiserror = "2.0.21"
+axum = "0.8.9"
+http = "1.5.0"
+redb = "4.5.0"
 hex = "0.4.3"
 governor = "0.10.4"
+sysinfo = "0.39.6"
+tokio-util = "0.7.20"
 
 [profile.release]
 strip = true      # 强制剔除符号（缩小 GNU 体积的关键）
 lto = true        # 开启全程序优化
-opt-level = "z"   # 针对体积优化
+opt-level = 3   # 针对性能优化
+codegen-units = 1 # 单编译单元，配合 LTO 获得更好的优化效果
+
+[dev-dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }

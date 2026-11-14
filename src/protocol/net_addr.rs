@@ -1,10 +1,25 @@
-use std::net::{Ipv4Addr, Ipv6Addr};
+use crate::protocol::utils::configure_tcp_stream;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 use std::{fmt, io};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 pub const ATYP_IPV4: u8 = 0x01;
 pub const ATYP_DOMAIN: u8 = 0x03;
 pub const ATYP_IPV6: u8 = 0x04;
+
+/// 协议中域名长度字段只有 1 字节
+pub const MAX_DOMAIN_LEN: usize = u8::MAX as usize;
+
+/// 域名解析超时上限，防止慢 DNS 长期占用阻塞线程池
+const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 单候选地址连接超时
+const SINGLE_ADDR_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// 多候选地址（如同时存在 AAAA 与 A 记录）时单个地址的尝试时限
+const MULTI_ADDR_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Happy Eyeballs (RFC 8305)：前一候选地址在 250ms 内未完成建连即并发启动下一候选地址
+const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum NetAddr {
@@ -24,137 +39,17 @@ impl fmt::Display for NetAddr {
     }
 }
 
-impl From<&NetAddr> for Vec<u8> {
-    fn from(value: &NetAddr) -> Self {
-        match value {
-            NetAddr::V4(ip, port) => {
-                // 1(ATYP) + 4(IPv4) + 2(Port) = 7
-                let mut buf = Vec::with_capacity(7);
-                buf.push(0x01);
-                buf.extend_from_slice(&ip.octets());
-                buf.extend_from_slice(&port.to_be_bytes());
-                buf
-            }
-            NetAddr::Domain(domain, port) => {
-                let bytes = domain.as_bytes();
-                let len = bytes.len();
-
-                // 协议限制域名长度最大为 255 (1 byte)
-                // From trait 不允许返回 Err，如果超长这里选择截断或 panic，
-                // 生产环境建议在构造 NetAddr 时就校验长度。
-                let len_u8 = if len > 255 { 255 } else { len as u8 };
-
-                // 1(ATYP) + 1(Len) + N(Domain) + 2(Port)
-                let mut buf = Vec::with_capacity(1 + 1 + len_u8 as usize + 2);
-                buf.push(0x03);
-                buf.push(len_u8);
-                buf.extend_from_slice(&bytes[..len_u8 as usize]);
-                buf.extend_from_slice(&port.to_be_bytes());
-                buf
-            }
-            NetAddr::V6(ip, port) => {
-                // 1(ATYP) + 16(IPv6) + 2(Port) = 19
-                let mut buf = Vec::with_capacity(19);
-                buf.push(0x04);
-                buf.extend_from_slice(&ip.octets());
-                buf.extend_from_slice(&port.to_be_bytes());
-                buf
-            }
+impl From<SocketAddr> for NetAddr {
+    fn from(addr: SocketAddr) -> Self {
+        match addr.ip() {
+            IpAddr::V4(ip) => NetAddr::V4(ip, addr.port()),
+            IpAddr::V6(ip) => NetAddr::V6(ip, addr.port()),
         }
     }
 }
 
-impl TryFrom<&Vec<u8>> for NetAddr {
-    type Error = io::Error;
-
-    fn try_from(value: &Vec<u8>) -> Result<Self, Self::Error> {
-        let data = value.as_slice();
-
-        if data.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Data too short",
-            ));
-        }
-
-        let atyp = data[0];
-        let mut cursor = 1;
-
-        match atyp {
-            0x01 => {
-                // IPv4
-                if data.len() < cursor + 4 + 2 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "Invalid IPv4 packet length",
-                    ));
-                }
-
-                // 读取 IP
-                let ip_bytes: [u8; 4] = data[cursor..cursor + 4]
-                    .try_into()
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                let ip = Ipv4Addr::from(ip_bytes);
-                cursor += 4;
-
-                // 读取 Port
-                let port = u16::from_be_bytes([data[cursor], data[cursor + 1]]);
-
-                Ok(NetAddr::V4(ip, port))
-            }
-            0x03 => {
-                // Domain
-                if data.len() <= cursor {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "Invalid Domain packet",
-                    ));
-                }
-
-                let len = data[cursor] as usize;
-                cursor += 1;
-
-                if data.len() < cursor + len + 2 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "Invalid Domain content length",
-                    ));
-                }
-
-                let domain_bytes = &data[cursor..cursor + len];
-                let domain = String::from_utf8(domain_bytes.to_vec())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                cursor += len;
-
-                let port = u16::from_be_bytes([data[cursor], data[cursor + 1]]);
-
-                Ok(NetAddr::Domain(domain, port))
-            }
-            0x04 => {
-                // IPv6
-                if data.len() < cursor + 16 + 2 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "Invalid IPv6 packet length",
-                    ));
-                }
-
-                let ip_bytes: [u8; 16] = data[cursor..cursor + 16]
-                    .try_into()
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                let ip = Ipv6Addr::from(ip_bytes);
-                cursor += 16;
-
-                let port = u16::from_be_bytes([data[cursor], data[cursor + 1]]);
-
-                Ok(NetAddr::V6(ip, port))
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Unsupported ATYP: {}", atyp),
-            )),
-        }
-    }
+fn invalid_input(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, msg)
 }
 
 impl NetAddr {
@@ -170,95 +65,207 @@ impl NetAddr {
         NetAddr::Domain(host, port)
     }
 
+    /// 编码后的字节长度: ATYP(1) + Addr + Port(2)
     pub fn bytes_len(&self) -> usize {
         match self {
-            NetAddr::V4(..) => 7,                            // 1 + 4 + 2
-            NetAddr::Domain(domain, ..) => 4 + domain.len(), // 1 + 1 + len + 2
-            NetAddr::V6(..) => 19,                           // 1 + 16 + 2
-        }
-    }
-
-    pub fn addr(&self) -> String {
-        match self {
-            NetAddr::V4(addr, ..) => format!("{}", addr),
-            NetAddr::Domain(host, ..) => host.clone(),
-            NetAddr::V6(addr, ..) => format!("[{}]", addr),
+            NetAddr::V4(..) => 7,
+            NetAddr::Domain(domain, ..) => 4 + domain.len(),
+            NetAddr::V6(..) => 19,
         }
     }
 
     pub fn port(&self) -> u16 {
-        let port = match self {
-            NetAddr::V4(_, port) => port,
-            NetAddr::Domain(_, port) => port,
-            NetAddr::V6(_, port) => port,
-        };
-        *port
+        match self {
+            NetAddr::V4(_, port) | NetAddr::Domain(_, port) | NetAddr::V6(_, port) => *port,
+        }
     }
 
-    pub fn write_to_buf(&self, buf: &mut Vec<u8>) {
+    /// 目标是 IP 时直接返回 SocketAddr；域名返回 None
+    pub fn socket_addr(&self) -> Option<SocketAddr> {
+        match self {
+            NetAddr::V4(ip, port) => Some(SocketAddr::from((*ip, *port))),
+            NetAddr::V6(ip, port) => Some(SocketAddr::from((*ip, *port))),
+            NetAddr::Domain(..) => None,
+        }
+    }
+
+    /// 解析为候选 SocketAddr 列表（IP 直接返回单元素，域名带超时返回全部解析结果）
+    pub async fn resolve_all(&self) -> io::Result<Vec<SocketAddr>> {
+        match self {
+            NetAddr::Domain(host, port) => {
+                if host.is_empty() {
+                    return Err(invalid_input("Empty domain"));
+                }
+                let resolved = tokio::time::timeout(
+                    DNS_RESOLVE_TIMEOUT,
+                    tokio::net::lookup_host((host.as_str(), *port)),
+                )
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("DNS lookup timed out for {}", host),
+                    )
+                })?
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::HostUnreachable,
+                        format!("DNS lookup failed for {}: {}", host, e),
+                    )
+                })?;
+                let addrs: Vec<SocketAddr> = resolved.collect();
+                if addrs.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("no address for {}", host),
+                    ));
+                }
+                Ok(addrs)
+            }
+            _ => Ok(vec![self.socket_addr().expect("IP address")]),
+        }
+    }
+
+    /// 解析为单个 SocketAddr（域名取第一条解析结果）
+    pub async fn resolve(&self) -> io::Result<SocketAddr> {
+        self.resolve_all()
+            .await
+            .map(|addrs| addrs.into_iter().next().expect("non-empty"))
+    }
+
+    /// 建立到该地址的 TCP 连接。
+    ///
+    /// IP 直接按 SocketAddr 连接；域名先带超时解析，再按单候选限时依次尝试全部解析结果，
+    /// 避免排在前面的不可达/黑洞地址（如无路由的 AAAA）耗尽整次连接时限。
+    pub async fn connect_tcp(&self) -> io::Result<TcpStream> {
+        let candidates = self.resolve_all().await?;
+        let per_addr_timeout = if candidates.len() > 1 {
+            MULTI_ADDR_CONNECT_TIMEOUT
+        } else {
+            SINGLE_ADDR_CONNECT_TIMEOUT
+        };
+        connect_tcp_candidates(&candidates, per_addr_timeout).await
+    }
+
+    /// 编码追加到 buf: ATYP(1) + Addr + Port(2)
+    pub fn write_to_buf(&self, buf: &mut Vec<u8>) -> io::Result<()> {
         match self {
             NetAddr::V4(ip, port) => {
-                buf.push(0x01);
+                buf.push(ATYP_IPV4);
                 buf.extend_from_slice(&ip.octets());
                 buf.extend_from_slice(&port.to_be_bytes());
             }
             NetAddr::Domain(domain, port) => {
-                buf.push(0x03);
-                buf.push(domain.len() as u8);
-                buf.extend_from_slice(domain.as_bytes());
+                let bytes = domain.as_bytes();
+                if bytes.len() > MAX_DOMAIN_LEN {
+                    return Err(invalid_input("Domain too long"));
+                }
+                buf.push(ATYP_DOMAIN);
+                buf.push(bytes.len() as u8);
+                buf.extend_from_slice(bytes);
                 buf.extend_from_slice(&port.to_be_bytes());
             }
             NetAddr::V6(ip, port) => {
-                buf.push(0x04);
+                buf.push(ATYP_IPV6);
                 buf.extend_from_slice(&ip.octets());
                 buf.extend_from_slice(&port.to_be_bytes());
             }
         }
+        Ok(())
     }
 
-    /// 从 AsyncRead流中读取并解析地址
+    pub fn to_bytes(&self) -> io::Result<Vec<u8>> {
+        let mut buf = Vec::with_capacity(self.bytes_len());
+        self.write_to_buf(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// 从字节切片解析地址: ATYP(1) + Addr + Port(2)
+    ///
+    /// 返回地址以及消耗的字节数
+    pub fn parse(data: &[u8]) -> io::Result<(Self, usize)> {
+        let (&atyp, rest) = data
+            .split_first()
+            .ok_or_else(|| invalid_input("Data too short"))?;
+
+        let (addr, consumed) = match atyp {
+            ATYP_IPV4 => {
+                let bytes: [u8; 4] = rest
+                    .get(..4)
+                    .and_then(|b| b.try_into().ok())
+                    .ok_or_else(|| invalid_input("Invalid IPv4 packet: data too short"))?;
+                (IpOrDomain::V4(Ipv4Addr::from(bytes)), 4)
+            }
+            ATYP_DOMAIN => {
+                let len = *rest
+                    .first()
+                    .ok_or_else(|| invalid_input("Invalid Domain packet: missing length byte"))?
+                    as usize;
+                let domain_bytes = rest
+                    .get(1..1 + len)
+                    .ok_or_else(|| invalid_input("Invalid Domain packet: data too short"))?;
+                let domain = String::from_utf8(domain_bytes.to_vec())
+                    .map_err(|_| invalid_input("Invalid Domain encoding"))?;
+                (IpOrDomain::Domain(domain), 1 + len)
+            }
+            ATYP_IPV6 => {
+                let bytes: [u8; 16] = rest
+                    .get(..16)
+                    .and_then(|b| b.try_into().ok())
+                    .ok_or_else(|| invalid_input("Invalid IPv6 packet: data too short"))?;
+                (IpOrDomain::V6(Ipv6Addr::from(bytes)), 16)
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Unsupported ATYP: {}", atyp),
+                ));
+            }
+        };
+
+        let port_bytes: [u8; 2] = rest
+            .get(consumed..consumed + 2)
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| invalid_input("Invalid address: missing port"))?;
+        let port = u16::from_be_bytes(port_bytes);
+
+        Ok((addr.with_port(port), 1 + consumed + 2))
+    }
+
+    /// 从 AsyncRead 流中读取并解析地址
     pub async fn read_from<R>(stream: &mut R) -> io::Result<Self>
     where
         R: AsyncRead + Unpin,
     {
-        // 1. 读取 ATYP 字节
         let atyp = stream.read_u8().await?;
-
-        match atyp {
-            0x01 => {
-                // IPv4
+        let addr = match atyp {
+            ATYP_IPV4 => {
                 let mut ip_bytes = [0u8; 4];
                 stream.read_exact(&mut ip_bytes).await?;
-                let port = stream.read_u16().await?; // tokio read_u16 默认是大端序
-
-                Ok(NetAddr::V4(Ipv4Addr::from(ip_bytes), port))
+                IpOrDomain::V4(Ipv4Addr::from(ip_bytes))
             }
-            0x03 => {
-                // Domain
+            ATYP_DOMAIN => {
                 let len = stream.read_u8().await? as usize;
                 let mut domain_bytes = vec![0u8; len];
                 stream.read_exact(&mut domain_bytes).await?;
-                let port = stream.read_u16().await?;
-
-                // 将 bytes 转为 String (通常假定是 UTF-8)
                 let domain = String::from_utf8(domain_bytes)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-                Ok(NetAddr::Domain(domain, port))
+                IpOrDomain::Domain(domain)
             }
-            0x04 => {
-                // IPv6
+            ATYP_IPV6 => {
                 let mut ip_bytes = [0u8; 16];
                 stream.read_exact(&mut ip_bytes).await?;
-                let port = stream.read_u16().await?;
-
-                Ok(NetAddr::V6(Ipv6Addr::from(ip_bytes), port))
+                IpOrDomain::V6(Ipv6Addr::from(ip_bytes))
             }
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Unsupported ATYP: {}", atyp),
-            )),
-        }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Unsupported ATYP: {}", atyp),
+                ));
+            }
+        };
+        let port = stream.read_u16().await?;
+        Ok(addr.with_port(port))
     }
 
     /// 将地址序列化并写入流
@@ -266,31 +273,205 @@ impl NetAddr {
     where
         W: AsyncWrite + Unpin,
     {
-        match self {
-            NetAddr::V4(addr, port) => {
-                stream.write_u8(0x01).await?;
-                stream.write_all(&addr.octets()).await?;
-                stream.write_u16(*port).await?;
+        stream.write_all(&self.to_bytes()?).await
+    }
+}
+
+/// 按 RFC 8305 将候选地址按地址族交替排列（如 IPv6、IPv4 交错），避免同一不可达地址族连续排在前面。
+fn interleave_address_families(candidates: &[SocketAddr]) -> Vec<SocketAddr> {
+    let first_is_v6 = candidates[0].is_ipv6();
+    let (primary, secondary): (Vec<SocketAddr>, Vec<SocketAddr>) = candidates
+        .iter()
+        .copied()
+        .partition(|addr| addr.is_ipv6() == first_is_v6);
+
+    let mut result = Vec::with_capacity(candidates.len());
+    let mut p = primary.into_iter();
+    let mut s = secondary.into_iter();
+    loop {
+        match (p.next(), s.next()) {
+            (Some(a), Some(b)) => {
+                result.push(a);
+                result.push(b);
             }
-            NetAddr::Domain(domain, port) => {
-                stream.write_u8(0x03).await?;
-                let bytes = domain.as_bytes();
-                if bytes.len() > 255 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "Domain too long",
-                    ));
+            (Some(a), None) => result.push(a),
+            (None, Some(b)) => result.push(b),
+            (None, None) => break,
+        }
+    }
+    result
+}
+
+fn spawn_connect_attempt(
+    tasks: &mut tokio::task::JoinSet<io::Result<TcpStream>>,
+    addr: SocketAddr,
+    per_addr_timeout: Duration,
+) {
+    tasks.spawn(async move {
+        tokio::time::timeout(per_addr_timeout, TcpStream::connect(addr))
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("connect to {} timed out", addr),
+                )
+            })?
+    });
+}
+
+/// Happy Eyeballs 并发交错竞速连接候选地址，首个连接成功即取消其余尝试并配置 `TCP_NODELAY` 与 Keepalive。
+pub async fn connect_tcp_candidates(
+    candidates: &[SocketAddr],
+    per_addr_timeout: Duration,
+) -> io::Result<TcpStream> {
+    if candidates.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no candidate addresses",
+        ));
+    }
+    if candidates.len() == 1 {
+        let stream = tokio::time::timeout(per_addr_timeout, TcpStream::connect(candidates[0]))
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("connect to {} timed out", candidates[0]),
+                )
+            })??;
+        let _ = configure_tcp_stream(&stream);
+        return Ok(stream);
+    }
+
+    let ordered = interleave_address_families(candidates);
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut next_idx = 1usize;
+    let mut last_err = None;
+
+    spawn_connect_attempt(&mut tasks, ordered[0], per_addr_timeout);
+
+    loop {
+        if next_idx < ordered.len() {
+            tokio::select! {
+                Some(join_res) = tasks.join_next() => {
+                    match join_res {
+                        Ok(Ok(stream)) => {
+                            tasks.abort_all();
+                            let _ = configure_tcp_stream(&stream);
+                            return Ok(stream);
+                        }
+                        Ok(Err(e)) => {
+                            last_err = Some(e);
+                            spawn_connect_attempt(&mut tasks, ordered[next_idx], per_addr_timeout);
+                            next_idx += 1;
+                        }
+                        Err(join_err) => {
+                            last_err = Some(io::Error::other(join_err));
+                        }
+                    }
                 }
-                stream.write_u8(bytes.len() as u8).await?;
-                stream.write_all(bytes).await?;
-                stream.write_u16(*port).await?;
+                _ = tokio::time::sleep(HAPPY_EYEBALLS_DELAY) => {
+                    spawn_connect_attempt(&mut tasks, ordered[next_idx], per_addr_timeout);
+                    next_idx += 1;
+                }
             }
-            NetAddr::V6(addr, port) => {
-                stream.write_u8(0x04).await?;
-                stream.write_all(&addr.octets()).await?;
-                stream.write_u16(*port).await?;
+        } else {
+            let Some(join_res) = tasks.join_next().await else {
+                break;
+            };
+            match join_res {
+                Ok(Ok(stream)) => {
+                    tasks.abort_all();
+                    let _ = configure_tcp_stream(&stream);
+                    return Ok(stream);
+                }
+                Ok(Err(e)) => last_err = Some(e),
+                Err(join_err) => last_err = Some(io::Error::other(join_err)),
             }
         }
-        Ok(())
+    }
+
+    Err(last_err
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no candidate addresses")))
+}
+
+/// 解析过程中的中间态（端口在最后才读到）
+enum IpOrDomain {
+    V4(Ipv4Addr),
+    Domain(String),
+    V6(Ipv6Addr),
+}
+
+impl IpOrDomain {
+    fn with_port(self, port: u16) -> NetAddr {
+        match self {
+            IpOrDomain::V4(ip) => NetAddr::V4(ip, port),
+            IpOrDomain::Domain(host) => NetAddr::Domain(host, port),
+            IpOrDomain::V6(ip) => NetAddr::V6(ip, port),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[tokio::test]
+    async fn test_roundtrip_all_types() {
+        let addrs = [
+            NetAddr::V4(Ipv4Addr::new(1, 2, 3, 4), 80),
+            NetAddr::Domain("example.com".into(), 443),
+            NetAddr::V6(Ipv6Addr::LOCALHOST, 8080),
+        ];
+        for addr in addrs {
+            let bytes = addr.to_bytes().unwrap();
+            assert_eq!(bytes.len(), addr.bytes_len());
+            assert_eq!(NetAddr::parse(&bytes).unwrap(), (addr.clone(), bytes.len()));
+            let read = NetAddr::read_from(&mut Cursor::new(bytes)).await.unwrap();
+            assert_eq!(read, addr);
+        }
+    }
+
+    #[test]
+    fn test_overlong_domain_is_rejected() {
+        let addr = NetAddr::Domain("a".repeat(MAX_DOMAIN_LEN + 1), 80);
+        assert!(addr.to_bytes().is_err());
+    }
+
+    #[test]
+    fn test_parse_truncated_port() {
+        assert!(NetAddr::parse(&[ATYP_IPV4, 1, 2, 3, 4, 0]).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_connect_ipv6_literal() {
+        // IPv6 目标此前会被拼成 "[::1]" 去做 DNS 查询而连接失败
+        let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            return; // 环境不支持 IPv6
+        };
+        let addr = NetAddr::from(listener.local_addr().unwrap());
+        let (conn, accepted) = tokio::join!(addr.connect_tcp(), listener.accept());
+        assert!(conn.is_ok());
+        assert!(accepted.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_connect_tcp_candidates_falls_back_on_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good_addr = listener.local_addr().unwrap();
+
+        // 找一个已关闭的本地端口作为失败首选候选
+        let dead_sock = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead_sock.local_addr().unwrap();
+        drop(dead_sock);
+
+        let candidates = [dead_addr, good_addr];
+        let (conn, accepted) = tokio::join!(
+            connect_tcp_candidates(&candidates, Duration::from_millis(500)),
+            listener.accept(),
+        );
+        assert!(conn.is_ok());
+        assert!(accepted.is_ok());
     }
 }
