@@ -1,4 +1,4 @@
-use crate::secret::replay::{REPLAY_GUARD, now_secs};
+use crate::secret::replay::{REPLAY_GUARD, ReplayReject, now_secs};
 use crate::user_manager::{UserManager, UserProfile};
 use hmac::{Hmac, KeyInit, Mac};
 use rand::RngExt;
@@ -82,11 +82,16 @@ pub fn verify_user_token(user_manager: &UserManager, token: &Uuid) -> Option<Ver
     })
 }
 
-/// 消费 Token：返回 `true` 表示首次使用(放行)，`false` 表示重放(拒绝)
+/// 消费 Token：返回 `true` 表示首次使用(放行)，`false` 表示重放或缓存满载(拒绝)
 ///
 /// 与密码学校验分开，便于调用方在通过全部前置检查后再记账。
 pub fn consume_token(token: &Uuid, expire_at: u64) -> bool {
     REPLAY_GUARD.try_use(token, expire_at)
+}
+
+/// 消费 Token 并返回具体拒绝原因，便于服务端区分重放攻击与缓存满载。
+pub fn consume_token_checked(token: &Uuid, expire_at: u64) -> Result<(), ReplayReject> {
+    REPLAY_GUARD.try_consume(token, expire_at)
 }
 
 /// Token 指纹(截断 SHA256 的十六进制)。

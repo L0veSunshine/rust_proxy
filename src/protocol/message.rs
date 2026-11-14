@@ -50,10 +50,28 @@ impl TryFrom<u8> for Command {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Response {
     Success = 0x01,
     Rejected = 0x02,
+    HostUnreachable = 0x03,
+    ConnectionRefused = 0x04,
+    TimedOut = 0x05,
+}
+
+impl Response {
+    /// 将服务端连接目标时的 I/O 错误映射为协议状态码
+    pub fn from_io_error(err: &io::Error) -> Self {
+        match err.kind() {
+            ErrorKind::ConnectionRefused => Response::ConnectionRefused,
+            ErrorKind::TimedOut => Response::TimedOut,
+            ErrorKind::NotFound
+            | ErrorKind::HostUnreachable
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::AddrNotAvailable => Response::HostUnreachable,
+            _ => Response::Rejected,
+        }
+    }
 }
 
 impl From<Response> for u8 {
@@ -68,6 +86,9 @@ impl TryFrom<u8> for Response {
         match value {
             0x01 => Ok(Response::Success),
             0x02 => Ok(Response::Rejected),
+            0x03 => Ok(Response::HostUnreachable),
+            0x04 => Ok(Response::ConnectionRefused),
+            0x05 => Ok(Response::TimedOut),
             _ => Err(Error::new(ErrorKind::InvalidInput, "Unknown response")),
         }
     }
@@ -82,6 +103,20 @@ pub async fn client_hello<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    client_hello_with_payload(stream, user_token, cmd, addr, &[]).await
+}
+
+/// 将握手头与可选的 0-RTT 初始载荷一次性拼包写出，避免拆成多个 TLS record。
+pub async fn client_hello_with_payload<W>(
+    stream: &mut W,
+    user_token: &Uuid,
+    cmd: &Command,
+    addr: &NetAddr,
+    initial_payload: &[u8],
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let pad_len = generate_gaussian_padding(
         HELLO_PADDING_MEAN,
         HELLO_PADDING_STD_DEV,
@@ -89,8 +124,9 @@ where
         HELLO_PADDING_MAX,
     );
 
-    // 整个握手包一次性写出，避免拆成多个 TLS record
-    let mut buf = Vec::with_capacity(16 + 3 + addr.bytes_len() + 2 + pad_len as usize);
+    let mut buf = Vec::with_capacity(
+        16 + 3 + addr.bytes_len() + 2 + pad_len as usize + initial_payload.len(),
+    );
     // 1. Header
     buf.extend_from_slice(user_token.as_bytes()); // Token
     buf.push(MESSAGE_VERSION); // Ver
@@ -101,6 +137,10 @@ where
     // 3. Random Padding
     buf.extend_from_slice(&pad_len.to_be_bytes());
     buf.resize(buf.len() + pad_len as usize, 0);
+    // 4. Optional 0-RTT Payload
+    if !initial_payload.is_empty() {
+        buf.extend_from_slice(initial_payload);
+    }
 
     stream.write_all(&buf).await?;
     stream.flush().await?;
@@ -125,8 +165,14 @@ where
     let cmd = stream.read_u8().await?.try_into()?;
     let addr = NetAddr::read_from(stream).await?;
 
-    // 读 Padding 长度
+    // 读 Padding 长度并校验上限，防止非本协议流量因超大长度字段一直等待读满缓冲区
     let pad_len = stream.read_u16().await?;
+    if pad_len > HELLO_PADDING_MAX {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Client hello padding exceeds limit",
+        ));
+    }
 
     // 跳过 Padding
     if pad_len > 0 {
@@ -158,10 +204,7 @@ where
     buf[1] = (*status).into();
     stream.write_all(&buf[..2 + random_len]).await?;
     stream.flush().await?;
-    match status {
-        Response::Success => Ok(()),
-        _ => Err(anyhow!("Unauthorized")),
-    }
+    Ok(())
 }
 
 pub async fn read_response_from_server<R>(stream: &mut R) -> Result<u8>

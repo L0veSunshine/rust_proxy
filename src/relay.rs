@@ -3,13 +3,17 @@
 use crate::RELAY_BUFFER_SIZE;
 use crate::user_manager::UserLimiter;
 use std::io;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
-use tracing::error;
+use tracing::{debug, error};
 
 /// 关闭写端（发送 FIN / TLS close_notify）的最长等待时间，防止对端不读导致卡死
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 整条隧道双方向完全无数据往来时的默认空闲超时（防止弱网半开连接永久占用配额）
+pub const DEFAULT_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// 写入并立即 flush。
 ///
@@ -30,10 +34,27 @@ where
 /// - 出错：取消 `cancel`，连带拆除另一方向。
 /// - `cancel` 被取消：立即停止。
 pub async fn relay_one_way<R, W, F>(
+    reader: R,
+    writer: W,
+    limiter: Option<&UserLimiter>,
+    cancel: &CancellationToken,
+    on_bytes: F,
+    direction: &str,
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    F: FnMut(usize),
+{
+    relay_one_way_tracked(reader, writer, limiter, cancel, None, on_bytes, direction).await;
+}
+
+/// 带活跃时间戳更新的单向转发
+pub async fn relay_one_way_tracked<R, W, F>(
     mut reader: R,
     mut writer: W,
     limiter: Option<&UserLimiter>,
     cancel: &CancellationToken,
+    activity: Option<(&Instant, &AtomicU64)>,
     mut on_bytes: F,
     direction: &str,
 ) where
@@ -51,10 +72,16 @@ pub async fn relay_one_way<R, W, F>(
                 if n == 0 {
                     return Ok::<_, io::Error>(());
                 }
+                if let Some((epoch, last_ms)) = activity {
+                    last_ms.store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+                }
                 if let Some(limiter) = limiter {
                     limiter.consume(n).await;
                 }
                 write_and_flush(&mut writer, &buf[..n]).await?;
+                if let Some((epoch, last_ms)) = activity {
+                    last_ms.store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+                }
                 on_bytes(n);
             }
         })
@@ -88,10 +115,91 @@ pub async fn relay_bidirectional<AR, AW, BR, BW, F1, F2>(
     F1: FnMut(usize),
     F2: FnMut(usize),
 {
-    tokio::join!(
-        relay_one_way(a_reader, b_writer, limiter, cancel, on_a_to_b, "upload"),
-        relay_one_way(b_reader, a_writer, limiter, cancel, on_b_to_a, "download"),
-    );
+    relay_bidirectional_with_idle(
+        a_reader,
+        a_writer,
+        b_reader,
+        b_writer,
+        limiter,
+        cancel,
+        DEFAULT_RELAY_IDLE_TIMEOUT,
+        on_a_to_b,
+        on_b_to_a,
+    )
+    .await;
+}
+
+/// 带连接级双向空闲超时的转发：只有上行和下行同时无数据超过 `idle_timeout` 才会触发超时关闭，
+/// 单向持续大文件下载不会误触发超时。
+#[allow(clippy::too_many_arguments)]
+pub async fn relay_bidirectional_with_idle<AR, AW, BR, BW, F1, F2>(
+    a_reader: AR,
+    a_writer: AW,
+    b_reader: BR,
+    b_writer: BW,
+    limiter: Option<&UserLimiter>,
+    cancel: &CancellationToken,
+    idle_timeout: Duration,
+    on_a_to_b: F1,
+    on_b_to_a: F2,
+) where
+    AR: AsyncRead + Unpin,
+    AW: AsyncWrite + Unpin,
+    BR: AsyncRead + Unpin,
+    BW: AsyncWrite + Unpin,
+    F1: FnMut(usize),
+    F2: FnMut(usize),
+{
+    let epoch = Instant::now();
+    let last_active_ms = AtomicU64::new(0);
+    let done = CancellationToken::new();
+
+    let transfer = async {
+        tokio::join!(
+            relay_one_way_tracked(
+                a_reader,
+                b_writer,
+                limiter,
+                cancel,
+                Some((&epoch, &last_active_ms)),
+                on_a_to_b,
+                "upload",
+            ),
+            relay_one_way_tracked(
+                b_reader,
+                a_writer,
+                limiter,
+                cancel,
+                Some((&epoch, &last_active_ms)),
+                on_b_to_a,
+                "download",
+            ),
+        );
+        done.cancel();
+    };
+
+    let watchdog = async {
+        let idle_ms = idle_timeout.as_millis().max(1) as u64;
+        loop {
+            let now_ms = epoch.elapsed().as_millis() as u64;
+            let silent_ms = now_ms.saturating_sub(last_active_ms.load(Ordering::Relaxed));
+            if silent_ms >= idle_ms {
+                debug!("Relay idle for {:?}, closing tunnel", idle_timeout);
+                cancel.cancel();
+                break;
+            }
+            let wait = Duration::from_millis(idle_ms - silent_ms);
+            if done
+                .run_until_cancelled(tokio::time::sleep(wait))
+                .await
+                .is_none()
+            {
+                break;
+            }
+        }
+    };
+
+    tokio::join!(transfer, watchdog);
 }
 
 #[cfg(test)]
@@ -153,5 +261,66 @@ mod tests {
         assert_eq!(&first_chunk, &[b'x'; 2048]);
 
         relay.abort();
+    }
+
+    #[tokio::test]
+    async fn test_idle_timeout_closes_silent_tunnel_but_keeps_unidirectional_stream() {
+        // 1. 双方向完全静默时，达到 idle_timeout 应自动退出并取消
+        let (_app, a) = duplex(1024);
+        let (b, _target) = duplex(1024);
+        let (a_r, a_w) = tokio::io::split(a);
+        let (b_r, b_w) = tokio::io::split(b);
+        let cancel = CancellationToken::new();
+
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            relay_bidirectional_with_idle(
+                a_r,
+                a_w,
+                b_r,
+                b_w,
+                None,
+                &cancel,
+                Duration::from_millis(60),
+                |_| {},
+                |_| {},
+            ),
+        )
+        .await
+        .expect("silent tunnel should be closed by idle watchdog");
+        assert!(cancel.is_cancelled());
+
+        // 2. 只有下行持续传输、上行完全静默时，绝不能误判为空闲超时
+        let (mut app, a) = duplex(1024);
+        let (b, mut target) = duplex(1024);
+        let (a_r, a_w) = tokio::io::split(a);
+        let (b_r, b_w) = tokio::io::split(b);
+        let cancel2 = CancellationToken::new();
+
+        let relay = relay_bidirectional_with_idle(
+            a_r,
+            a_w,
+            b_r,
+            b_w,
+            None,
+            &cancel2,
+            Duration::from_millis(80),
+            |_| {},
+            |_| {},
+        );
+        let peers = async {
+            for _ in 0..4 {
+                tokio::time::sleep(Duration::from_millis(35)).await;
+                target.write_all(b"chunk").await.unwrap();
+            }
+            target.shutdown().await.unwrap();
+            app.shutdown().await.unwrap();
+
+            let mut received = Vec::new();
+            app.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, b"chunkchunkchunkchunk");
+        };
+        tokio::join!(relay, peers);
+        assert!(!cancel2.is_cancelled());
     }
 }

@@ -15,6 +15,12 @@ const SOCKS5_VERSION: u8 = 0x05;
 
 const NO_AUTHENTICATE: u8 = 0x00;
 
+pub const REPLY_SUCCEEDED: u8 = 0x00;
+pub const REPLY_GENERAL_FAILURE: u8 = 0x01;
+pub const REPLY_NETWORK_UNREACHABLE: u8 = 0x03;
+pub const REPLY_HOST_UNREACHABLE: u8 = 0x04;
+pub const REPLY_CONNECTION_REFUSED: u8 = 0x05;
+
 pub async fn handshake(stream: &mut TcpStream) -> Result<SocksRequest> {
     // 1. 认证协商
     let version = stream.read_u8().await?;
@@ -45,7 +51,11 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<SocksRequest> {
 }
 
 pub async fn send_reply(stream: &mut TcpStream, addr: SocketAddr) -> Result<()> {
-    let mut reply = vec![0x05, 0x00, 0x00];
+    send_reply_with_code(stream, REPLY_SUCCEEDED, addr).await
+}
+
+pub async fn send_reply_with_code(stream: &mut TcpStream, rep: u8, addr: SocketAddr) -> Result<()> {
+    let mut reply = vec![SOCKS5_VERSION, rep, 0x00];
     match addr.ip() {
         V4(ip) => {
             reply.push(0x01);
@@ -58,6 +68,7 @@ pub async fn send_reply(stream: &mut TcpStream, addr: SocketAddr) -> Result<()> 
     };
     reply.extend_from_slice(&addr.port().to_be_bytes());
     stream.write_all(&reply).await?;
+    stream.flush().await?;
     Ok(())
 }
 

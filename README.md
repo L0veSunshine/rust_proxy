@@ -293,6 +293,8 @@ client [OPTIONS]
   --api-port <API_PORT>          API 端口 [默认: 1081]
   --log-level <LOG_LEVEL>        日志级别 [默认: info]
   --log-rotate-size <SIZE>       日志轮转大小 [默认: 10485760]
+  --no-0rtt                      关闭 0-RTT 模式，等待服务端确认连上目标后再向本地应用回复状态
+  --max-connections <NUM>        本地最大并发代理连接数，0 表示无限制 [默认: 4096]
   -h, --help                     显示帮助信息
 ```
 

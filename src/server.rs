@@ -7,24 +7,28 @@ use crate::protocol::message::{
     Command, Response, encode_udp_frame, read_client_request, read_udp_frame, response_to_client,
 };
 use crate::protocol::net_addr::NetAddr;
-use crate::protocol::utils::{NATType, bind_dual_stack_udp, get_canonical_ip, to_dual_stack};
-use crate::relay::{relay_bidirectional, write_and_flush};
+use crate::protocol::utils::{
+    NATType, bind_dual_stack_udp, configure_tcp_stream, get_canonical_ip, to_dual_stack,
+};
+use crate::relay::{DEFAULT_RELAY_IDLE_TIMEOUT, relay_bidirectional, write_and_flush};
+use crate::secret::replay::ReplayReject;
 use crate::secret::tls;
-use crate::secret::totp::{consume_token, token_fingerprint, verify_user_token};
+use crate::secret::totp::{consume_token_checked, token_fingerprint, verify_user_token};
 use crate::shutdown::{ConnectionGuard, GracefulShutdown};
 use crate::user_manager::{UserLimiter, UserManager};
 use anyhow::Result;
 use moka::future::Cache;
-use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::select;
-use tokio::time::timeout_at;
+use tokio::time::{timeout, timeout_at};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -40,15 +44,25 @@ pub const UDP_BUFFER_SIZE: usize = 65535;
 
 /// 从 TCP 建连到读完 Client Hello（含 TLS 握手）的总时限，防御 Slowloris
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 服务端向目标建立 TCP 连接（含域名解析）的总时限
+const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Client Hello 的最大长度，超过即视为非本协议流量并回落
 const HANDSHAKE_BUFFER_SIZE: usize = 1024;
 /// RFC 4787：NAT 维护 UDP 映射的超时时间应不少于 2 分钟
 const NAT_MAPPING_IDLE: Duration = Duration::from_secs(120);
-/// UDP 关联内域名解析结果的缓存时间与条目上限
+/// UDP 关联内域名解析结果的缓存时间、失败负缓存时间、解析超时与条目上限
 const UDP_DNS_CACHE_TTL: Duration = Duration::from_secs(60);
+const UDP_DNS_NEGATIVE_TTL: Duration = Duration::from_secs(5);
+const UDP_DNS_TIMEOUT: Duration = Duration::from_secs(3);
 const UDP_DNS_CACHE_MAX: usize = 1024;
 /// accept 出错（如文件描述符耗尽）后的退避时间，避免空转
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Copy)]
+enum UdpDnsEntry {
+    Resolved(SocketAddr, Instant),
+    Failed(Instant),
+}
 
 pub async fn run(
     configs: ServerConfig,
@@ -112,11 +126,6 @@ pub async fn serve(
     connection_pool: ConnectionPool,
     shutdown: GracefulShutdown,
 ) -> Result<()> {
-    let ka = TcpKeepalive::new()
-        .with_time(Duration::from_secs(60)) // 空闲60秒后开始探测
-        .with_interval(Duration::from_secs(10)) // 探测失败后每10秒重试
-        .with_retries(3); // 重试3次失败则断开
-
     loop {
         // 等待新连接或关闭信号（CancellationToken 触发后状态保持，不会漏掉信号）
         let accept_result = select! {
@@ -149,13 +158,7 @@ pub async fn serve(
         };
 
         // 单个 socket 设置失败只影响这条连接，不能让整个服务退出
-        let sock_opts = {
-            let native_socket = SockRef::from(&socket);
-            native_socket
-                .set_tcp_nodelay(true)
-                .and_then(|_| native_socket.set_tcp_keepalive(&ka))
-        };
-        if let Err(e) = sock_opts {
+        if let Err(e) = configure_tcp_stream(&socket) {
             warn!("Failed to set socket options for {}: {}", peer, e);
             continue;
         }
@@ -280,13 +283,20 @@ async fn handle_client(
     //    避免后续步骤失败时把这次 token 白白烧掉。
     //    函数结束时 _ip_guard 被销毁，自动调用 leave_ip
     let _ip_guard = manager.enter_ip(key_sig, get_canonical_ip(peer_ip))?;
-    if !consume_token(&uuid, verified.expire_at) {
+    if let Err(reject) = consume_token_checked(&uuid, verified.expire_at) {
         // 不打印原始 token，避免日志泄露可用于重放的凭证
-        warn!(
-            "Replay Attack Detected (user {:x?}, token fp {})",
-            key_sig,
-            token_fingerprint(&uuid)
-        );
+        match reject {
+            ReplayReject::Replay => warn!(
+                "Replay Attack Detected (user {:x?}, token fp {})",
+                key_sig,
+                token_fingerprint(&uuid)
+            ),
+            ReplayReject::CapacityExceeded => warn!(
+                "Replay guard capacity saturated, rejecting handshake (user {:x?}, token fp {})",
+                key_sig,
+                token_fingerprint(&uuid)
+            ),
+        }
         // 回落到 Web 服务前先释放 IP 名额，避免重放连接占用合法用户配额
         drop(_ip_guard);
         return handle_tls_fallback(&peek[..offset], stream).await;
@@ -295,17 +305,37 @@ async fn handle_client(
     let limiter = manager.get_user_limiter(key_sig, verified.profile.rate_limit);
     let limiter = limiter.as_deref();
 
-    response_to_client(&mut stream, &Response::Success).await?;
-
-    // 握手包之后客户端可能已经发来了数据，先把这部分接到读端前面
+    // 握手包之后客户端可能已经通过 0-RTT 发来了首包载荷，保留并在建连成功后接回读端
     let remaining = peek[consumed_len..offset].to_vec();
-    let (client_reader, client_writer) = tokio::io::split(stream);
-    let client_reader = AsyncReadExt::chain(Cursor::new(remaining), client_reader);
 
     match cmd {
         Command::TcpConnect => {
-            let target = addr.connect_tcp().await?;
+            // 真正连上目标后再向客户端返回 Response::Success；连接失败则返回对应错误状态码
+            let target = match timeout(TARGET_CONNECT_TIMEOUT, addr.connect_tcp()).await {
+                Ok(Ok(target)) => target,
+                Ok(Err(e)) => {
+                    let status = Response::from_io_error(&e);
+                    warn!(
+                        "Failed to connect target {}: {} (responding {:?})",
+                        addr, e, status
+                    );
+                    let _ = response_to_client(&mut stream, &status).await;
+                    let _ = timeout(Duration::from_secs(2), stream.shutdown()).await;
+                    return Ok(());
+                }
+                Err(_) => {
+                    warn!("Connect target {} timed out", addr);
+                    let _ = response_to_client(&mut stream, &Response::TimedOut).await;
+                    let _ = timeout(Duration::from_secs(2), stream.shutdown()).await;
+                    return Ok(());
+                }
+            };
+
             info!("Tcp connect to {}", addr);
+            response_to_client(&mut stream, &Response::Success).await?;
+
+            let (client_reader, client_writer) = tokio::io::split(stream);
+            let client_reader = AsyncReadExt::chain(Cursor::new(remaining), client_reader);
             let (target_r, target_w) = target.into_split();
             let cancel = CancellationToken::new();
             relay_bidirectional(
@@ -321,7 +351,22 @@ async fn handle_client(
             .await;
         }
         Command::UdpAssociate => {
+            let socket = match bind_dual_stack_udp() {
+                Ok(sock) => sock,
+                Err(e) => {
+                    error!("Failed to bind UDP relay socket: {}", e);
+                    let _ = response_to_client(&mut stream, &Response::Rejected).await;
+                    let _ = timeout(Duration::from_secs(2), stream.shutdown()).await;
+                    return Ok(());
+                }
+            };
+
+            response_to_client(&mut stream, &Response::Success).await?;
+
+            let (client_reader, client_writer) = tokio::io::split(stream);
+            let client_reader = AsyncReadExt::chain(Cursor::new(remaining), client_reader);
             relay_udp(
+                socket,
                 client_reader,
                 client_writer,
                 nat_type,
@@ -345,38 +390,77 @@ fn nat_key(nat_type: NATType, addr: SocketAddr) -> (IpAddr, u16) {
     }
 }
 
-/// 解析 UDP 目标的候选地址列表：命中未过期缓存时直接返回上次可用的地址，否则解析全部候选地址
+fn trim_udp_dns_cache(cache: &mut HashMap<String, UdpDnsEntry>) {
+    if cache.len() < UDP_DNS_CACHE_MAX {
+        return;
+    }
+    cache.retain(|_, entry| match entry {
+        UdpDnsEntry::Resolved(_, at) => at.elapsed() < UDP_DNS_CACHE_TTL,
+        UdpDnsEntry::Failed(at) => at.elapsed() < UDP_DNS_NEGATIVE_TTL,
+    });
+    if cache.len() >= UDP_DNS_CACHE_MAX {
+        cache.clear();
+    }
+}
+
+/// 解析 UDP 目标的候选地址列表：
+/// - 命中有效正缓存直接返回上次可达地址；
+/// - 命中短期负缓存立即快速失败，避免不可解析域名在单条 UDP 关联上造成反复队头阻塞；
+/// - 未命中时带超时解析全部候选地址。
 async fn resolve_candidates(
-    cache: &HashMap<String, (SocketAddr, Instant)>,
+    cache: &mut HashMap<String, UdpDnsEntry>,
     addr: &NetAddr,
 ) -> std::io::Result<Vec<SocketAddr>> {
     if let Some(socket_addr) = addr.socket_addr() {
         return Ok(vec![socket_addr]);
     }
-    if let Some((resolved, at)) = cache.get(&addr.to_string())
-        && at.elapsed() < UDP_DNS_CACHE_TTL
-    {
-        return Ok(vec![*resolved]);
+
+    let key = addr.to_string();
+    match cache.get(&key) {
+        Some(UdpDnsEntry::Resolved(resolved, at)) if at.elapsed() < UDP_DNS_CACHE_TTL => {
+            return Ok(vec![*resolved]);
+        }
+        Some(UdpDnsEntry::Failed(at)) if at.elapsed() < UDP_DNS_NEGATIVE_TTL => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("negative DNS cache hit for {}", addr),
+            ));
+        }
+        _ => {}
     }
-    addr.resolve_all().await
+
+    match timeout(UDP_DNS_TIMEOUT, addr.resolve_all()).await {
+        Ok(Ok(candidates)) => Ok(candidates),
+        Ok(Err(e)) => {
+            trim_udp_dns_cache(cache);
+            cache.insert(key, UdpDnsEntry::Failed(Instant::now()));
+            Err(e)
+        }
+        Err(_) => {
+            trim_udp_dns_cache(cache);
+            cache.insert(key, UdpDnsEntry::Failed(Instant::now()));
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("UDP DNS lookup timed out for {}", addr),
+            ))
+        }
+    }
 }
 
 /// 缓存域名实际发送成功的 SocketAddr，避免后续包重复做 DNS 解析或反复尝试不可达地址族
 fn cache_resolved_udp(
-    cache: &mut HashMap<String, (SocketAddr, Instant)>,
+    cache: &mut HashMap<String, UdpDnsEntry>,
     addr: &NetAddr,
     resolved: SocketAddr,
 ) {
     if !matches!(addr, NetAddr::Domain(..)) {
         return;
     }
-    if cache.len() >= UDP_DNS_CACHE_MAX {
-        cache.retain(|_, (_, at)| at.elapsed() < UDP_DNS_CACHE_TTL);
-        if cache.len() >= UDP_DNS_CACHE_MAX {
-            cache.clear();
-        }
-    }
-    cache.insert(addr.to_string(), (resolved, Instant::now()));
+    trim_udp_dns_cache(cache);
+    cache.insert(
+        addr.to_string(),
+        UdpDnsEntry::Resolved(resolved, Instant::now()),
+    );
 }
 
 /// 依次尝试向候选地址发送 UDP 数据包，返回首个发送成功的地址。
@@ -411,6 +495,7 @@ async fn send_udp_first_reachable(
 
 /// UDP 模式：TLS 隧道 <-> 本地 UDP socket
 async fn relay_udp<R, W>(
+    socket: tokio::net::UdpSocket,
     mut client_reader: R,
     mut client_writer: W,
     nat_type: NATType,
@@ -422,7 +507,6 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let socket = bind_dual_stack_udp()?;
     // Full Cone 不需要白名单，避免为每个关联都建一个缓存
     let whitelist: Option<Cache<(IpAddr, u16), ()>> = match nat_type {
         NATType::FullCone => None,
@@ -434,6 +518,9 @@ where
         ),
     };
     let cancel = CancellationToken::new();
+    let done = CancellationToken::new();
+    let epoch = Instant::now();
+    let last_active_ms = AtomicU64::new(0);
 
     // 外部 -> 代理 -> 客户端
     let inbound = async {
@@ -456,6 +543,7 @@ where
                 continue;
             }
 
+            last_active_ms.store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
             let src = SocketAddr::new(get_canonical_ip(src_addr.ip()), src_addr.port());
             frame.clear();
             if let Err(e) = encode_udp_frame(&NetAddr::from(src), &buf[..n], &mut frame) {
@@ -469,6 +557,7 @@ where
                 error!("Server write udp to client error {}", e);
                 break;
             }
+            last_active_ms.store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
             stat_map.update_download(key_sig, n);
         }
     };
@@ -481,7 +570,8 @@ where
                 Ok(frame) => frame,
                 Err(_) => break,
             };
-            let candidates = match resolve_candidates(&dns_cache, &addr).await {
+            last_active_ms.store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+            let candidates = match resolve_candidates(&mut dns_cache, &addr).await {
                 Ok(candidates) => candidates,
                 Err(e) => {
                     warn!("Resolve udp target {} error: {}", addr, e);
@@ -503,6 +593,7 @@ where
             {
                 Ok(chosen) => {
                     cache_resolved_udp(&mut dns_cache, &addr, chosen);
+                    last_active_ms.store(epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
                     stat_map.update_upload(key_sig, payload.len());
                 }
                 Err(e) => {
@@ -517,17 +608,42 @@ where
         }
     };
 
-    // 任意一个方向结束都拆除整个关联
-    tokio::join!(
-        async {
-            cancel.run_until_cancelled(inbound).await;
-            cancel.cancel();
-        },
-        async {
-            cancel.run_until_cancelled(outbound).await;
-            cancel.cancel();
-        },
-    );
+    let watchdog = async {
+        let idle_ms = DEFAULT_RELAY_IDLE_TIMEOUT.as_millis().max(1) as u64;
+        loop {
+            let now_ms = epoch.elapsed().as_millis() as u64;
+            let silent_ms = now_ms.saturating_sub(last_active_ms.load(Ordering::Relaxed));
+            if silent_ms >= idle_ms {
+                debug!("UDP relay idle timeout reached, closing association");
+                cancel.cancel();
+                break;
+            }
+            let wait = Duration::from_millis(idle_ms - silent_ms);
+            if done
+                .run_until_cancelled(tokio::time::sleep(wait))
+                .await
+                .is_none()
+            {
+                break;
+            }
+        }
+    };
+
+    // 任意一个方向结束或长期空闲都拆除整个关联
+    let transfer = async {
+        tokio::join!(
+            async {
+                cancel.run_until_cancelled(inbound).await;
+                cancel.cancel();
+            },
+            async {
+                cancel.run_until_cancelled(outbound).await;
+                cancel.cancel();
+            },
+        );
+        done.cancel();
+    };
+    tokio::join!(transfer, watchdog);
     Ok(())
 }
 

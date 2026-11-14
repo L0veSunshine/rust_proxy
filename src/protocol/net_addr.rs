@@ -1,4 +1,6 @@
+use crate::protocol::utils::configure_tcp_stream;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 use std::{fmt, io};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -9,6 +11,15 @@ pub const ATYP_IPV6: u8 = 0x04;
 
 /// 协议中域名长度字段只有 1 字节
 pub const MAX_DOMAIN_LEN: usize = u8::MAX as usize;
+
+/// 域名解析超时上限，防止慢 DNS 长期占用阻塞线程池
+const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 单候选地址连接超时
+const SINGLE_ADDR_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// 多候选地址（如同时存在 AAAA 与 A 记录）时单个地址的尝试时限
+const MULTI_ADDR_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Happy Eyeballs (RFC 8305)：前一候选地址在 250ms 内未完成建连即并发启动下一候选地址
+const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum NetAddr {
@@ -78,13 +89,31 @@ impl NetAddr {
         }
     }
 
-    /// 解析为候选 SocketAddr 列表（IP 直接返回单元素，域名返回全部解析结果）
+    /// 解析为候选 SocketAddr 列表（IP 直接返回单元素，域名带超时返回全部解析结果）
     pub async fn resolve_all(&self) -> io::Result<Vec<SocketAddr>> {
         match self {
             NetAddr::Domain(host, port) => {
-                let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), *port))
-                    .await?
-                    .collect();
+                if host.is_empty() {
+                    return Err(invalid_input("Empty domain"));
+                }
+                let resolved = tokio::time::timeout(
+                    DNS_RESOLVE_TIMEOUT,
+                    tokio::net::lookup_host((host.as_str(), *port)),
+                )
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("DNS lookup timed out for {}", host),
+                    )
+                })?
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::HostUnreachable,
+                        format!("DNS lookup failed for {}: {}", host, e),
+                    )
+                })?;
+                let addrs: Vec<SocketAddr> = resolved.collect();
                 if addrs.is_empty() {
                     return Err(io::Error::new(
                         io::ErrorKind::NotFound,
@@ -106,13 +135,16 @@ impl NetAddr {
 
     /// 建立到该地址的 TCP 连接。
     ///
-    /// IP 直接按 SocketAddr 连接（IPv6 不能带方括号去做 DNS 查询）；
-    /// 域名交给系统解析，并依次尝试所有解析结果。
+    /// IP 直接按 SocketAddr 连接；域名先带超时解析，再按单候选限时依次尝试全部解析结果，
+    /// 避免排在前面的不可达/黑洞地址（如无路由的 AAAA）耗尽整次连接时限。
     pub async fn connect_tcp(&self) -> io::Result<TcpStream> {
-        match self {
-            NetAddr::Domain(host, port) => TcpStream::connect((host.as_str(), *port)).await,
-            _ => TcpStream::connect(self.socket_addr().expect("IP address")).await,
-        }
+        let candidates = self.resolve_all().await?;
+        let per_addr_timeout = if candidates.len() > 1 {
+            MULTI_ADDR_CONNECT_TIMEOUT
+        } else {
+            SINGLE_ADDR_CONNECT_TIMEOUT
+        };
+        connect_tcp_candidates(&candidates, per_addr_timeout).await
     }
 
     /// 编码追加到 buf: ATYP(1) + Addr + Port(2)
@@ -245,6 +277,124 @@ impl NetAddr {
     }
 }
 
+/// 按 RFC 8305 将候选地址按地址族交替排列（如 IPv6、IPv4 交错），避免同一不可达地址族连续排在前面。
+fn interleave_address_families(candidates: &[SocketAddr]) -> Vec<SocketAddr> {
+    let first_is_v6 = candidates[0].is_ipv6();
+    let (primary, secondary): (Vec<SocketAddr>, Vec<SocketAddr>) = candidates
+        .iter()
+        .copied()
+        .partition(|addr| addr.is_ipv6() == first_is_v6);
+
+    let mut result = Vec::with_capacity(candidates.len());
+    let mut p = primary.into_iter();
+    let mut s = secondary.into_iter();
+    loop {
+        match (p.next(), s.next()) {
+            (Some(a), Some(b)) => {
+                result.push(a);
+                result.push(b);
+            }
+            (Some(a), None) => result.push(a),
+            (None, Some(b)) => result.push(b),
+            (None, None) => break,
+        }
+    }
+    result
+}
+
+fn spawn_connect_attempt(
+    tasks: &mut tokio::task::JoinSet<io::Result<TcpStream>>,
+    addr: SocketAddr,
+    per_addr_timeout: Duration,
+) {
+    tasks.spawn(async move {
+        tokio::time::timeout(per_addr_timeout, TcpStream::connect(addr))
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("connect to {} timed out", addr),
+                )
+            })?
+    });
+}
+
+/// Happy Eyeballs 并发交错竞速连接候选地址，首个连接成功即取消其余尝试并配置 `TCP_NODELAY` 与 Keepalive。
+pub async fn connect_tcp_candidates(
+    candidates: &[SocketAddr],
+    per_addr_timeout: Duration,
+) -> io::Result<TcpStream> {
+    if candidates.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no candidate addresses",
+        ));
+    }
+    if candidates.len() == 1 {
+        let stream = tokio::time::timeout(per_addr_timeout, TcpStream::connect(candidates[0]))
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("connect to {} timed out", candidates[0]),
+                )
+            })??;
+        let _ = configure_tcp_stream(&stream);
+        return Ok(stream);
+    }
+
+    let ordered = interleave_address_families(candidates);
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut next_idx = 1usize;
+    let mut last_err = None;
+
+    spawn_connect_attempt(&mut tasks, ordered[0], per_addr_timeout);
+
+    loop {
+        if next_idx < ordered.len() {
+            tokio::select! {
+                Some(join_res) = tasks.join_next() => {
+                    match join_res {
+                        Ok(Ok(stream)) => {
+                            tasks.abort_all();
+                            let _ = configure_tcp_stream(&stream);
+                            return Ok(stream);
+                        }
+                        Ok(Err(e)) => {
+                            last_err = Some(e);
+                            spawn_connect_attempt(&mut tasks, ordered[next_idx], per_addr_timeout);
+                            next_idx += 1;
+                        }
+                        Err(join_err) => {
+                            last_err = Some(io::Error::other(join_err));
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(HAPPY_EYEBALLS_DELAY) => {
+                    spawn_connect_attempt(&mut tasks, ordered[next_idx], per_addr_timeout);
+                    next_idx += 1;
+                }
+            }
+        } else {
+            let Some(join_res) = tasks.join_next().await else {
+                break;
+            };
+            match join_res {
+                Ok(Ok(stream)) => {
+                    tasks.abort_all();
+                    let _ = configure_tcp_stream(&stream);
+                    return Ok(stream);
+                }
+                Ok(Err(e)) => last_err = Some(e),
+                Err(join_err) => last_err = Some(io::Error::other(join_err)),
+            }
+        }
+    }
+
+    Err(last_err
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no candidate addresses")))
+}
+
 /// 解析过程中的中间态（端口在最后才读到）
 enum IpOrDomain {
     V4(Ipv4Addr),
@@ -302,6 +452,25 @@ mod tests {
         };
         let addr = NetAddr::from(listener.local_addr().unwrap());
         let (conn, accepted) = tokio::join!(addr.connect_tcp(), listener.accept());
+        assert!(conn.is_ok());
+        assert!(accepted.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_connect_tcp_candidates_falls_back_on_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good_addr = listener.local_addr().unwrap();
+
+        // 找一个已关闭的本地端口作为失败首选候选
+        let dead_sock = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead_sock.local_addr().unwrap();
+        drop(dead_sock);
+
+        let candidates = [dead_addr, good_addr];
+        let (conn, accepted) = tokio::join!(
+            connect_tcp_candidates(&candidates, Duration::from_millis(500)),
+            listener.accept(),
+        );
         assert!(conn.is_ok());
         assert!(accepted.is_ok());
     }

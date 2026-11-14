@@ -2,7 +2,7 @@ use crate::protocol::net_addr::NetAddr;
 use anyhow::{Result, anyhow, bail};
 use http::Uri;
 use std::net::IpAddr;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 pub enum HttpRequest {
@@ -108,18 +108,26 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<HttpRequest> {
 }
 
 /// 发送 HTTP 200 Connection Established 响应；
-pub async fn send_connect_success(stream: &mut TcpStream) -> Result<()> {
+pub async fn send_connect_success<W>(stream: &mut W) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let response = b"HTTP/1.1 200 Connection Established\r\n\r\n";
     stream.write_all(response).await?;
+    stream.flush().await?;
     Ok(())
 }
 
 /// 发送 HTTP 错误响应
-pub async fn send_error(stream: &mut TcpStream, status_code: u16, message: &str) -> Result<()> {
+pub async fn send_error<W>(stream: &mut W, status_code: u16, message: &str) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let response = format!(
-        "HTTP/1.1 {} {}\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
         status_code, message
     );
     stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
     Ok(())
 }

@@ -2,10 +2,12 @@ use anyhow::Result;
 use clap::ValueEnum;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
 use std::f64::consts::PI;
 use std::fmt::Display;
+use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, ValueEnum)]
 pub enum NATType {
@@ -68,6 +70,18 @@ pub fn to_dual_stack(addr: SocketAddr) -> SocketAddr {
         SocketAddr::V4(v4) => SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port()),
         v6 => v6,
     }
+}
+
+/// 统一配置 TCP 套接字选项：禁用 Nagle 算法并开启 TCP Keepalive，
+/// 防止 0-RTT 小包被延迟确认阻塞，以及弱网下 NAT 映射静默断开后连接长期悬空。
+pub fn configure_tcp_stream(stream: &tokio::net::TcpStream) -> io::Result<()> {
+    let ka = TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(10))
+        .with_retries(3);
+    let sock = SockRef::from(stream);
+    sock.set_tcp_nodelay(true)?;
+    sock.set_tcp_keepalive(&ka)
 }
 
 /// 生成符合高斯分布（正态分布）的 Padding 长度

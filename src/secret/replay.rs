@@ -1,48 +1,174 @@
-use dashmap::DashMap;
-use dashmap::mapref::entry::Entry;
-use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-/// 两次"按时间清理"之间的最小间隔(秒)，避免每次握手都做全表扫描
-const PURGE_INTERVAL: u64 = 5;
-
-/// 两次"按容量兜底裁剪"之间的最小间隔(秒)。
-/// 容量裁剪只有在缓存真的顶到上限时才可能触发，这里同样做节流，
-/// 防止在极端情况下退化成"每次握手都扫描全表"。
-const TRIM_INTERVAL: u64 = 5;
-
-/// 缓存条目数的安全上限(默认)。
+/// 默认缓存条目数的严格瞬时上限。
 ///
-/// 正常靠时间清理就够了：Token 的 TOTP 窗口只有几秒，
-/// 过期记录会被定期清掉，缓存规模基本等于"一个时间窗内的握手数"。
-/// 只有在时间清理失效(如系统时钟被回拨)时才会顶到上限，
-/// 这时由容量兜底裁剪保证内存有界。
+/// 在 10s TOTP 步长（最多约 20~30s 有效窗口）下可支撑约 3,300~5,000 次/秒的新建握手；
+/// 超出上限且清理全部已过期条目后仍满载时采用 fail-closed 拒绝，绝不提前淘汰仍有效的记录。
 const MAX_CACHED_TOKENS: usize = 100_000;
+
+/// 分片数（2 的幂），利用 Token 中的 HMAC 字节均匀散列，降低锁竞争并消除全表停顿扫描
+const SHARD_COUNT: usize = 64;
+
+/// 单条记录的最长单调时钟保留时间（秒）。
+///
+/// 正常 TOTP 有效窗口不超过 3 个步长（30s）。附加单调时钟上限是为了在系统时钟被大幅回拨
+/// （导致墙钟 `expire_at > now` 长时间成立）时，依然能在有限单调时间内自动回收旧条目，
+/// 无需依赖牺牲安全性的半表裁剪。
+const MAX_MONOTONIC_RETENTION: Duration = Duration::from_secs(60);
+
+/// Token 消费失败的原因
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayReject {
+    /// 该 Token 在有效期内已被消费过（重放攻击）
+    Replay,
+    /// 防重放缓存已被未过期的有效记录占满（拒绝放行，避免淘汰有效记录导致重放漏检）
+    CapacityExceeded,
+}
 
 /// 全局的重放防御缓存
 ///
 /// TOTP 只能把攻击面压缩到一个时间窗内，无法阻止攻击者在窗口内
 /// 原样重放抓到的 Token，所以这里再记录一份"已经用掉的 Token"。
-///
-/// 容量策略：正常由时间清理维持规模；上限只作为时钟异常时的兜底，
-/// 详见 [`ReplayGuard::purge_if_needed`]。
 pub static REPLAY_GUARD: LazyLock<ReplayGuard> = LazyLock::new(ReplayGuard::new);
 
-/// 已使用 Token 的内存缓存
+#[derive(Clone, Copy)]
+struct Record {
+    generation: u64,
+    expire_at: u64,
+    mono_deadline: Instant,
+}
+
+impl Record {
+    #[inline]
+    fn is_expired(&self, now_secs: u64, now_instant: Instant) -> bool {
+        self.expire_at <= now_secs || self.mono_deadline <= now_instant
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct HeapEntry {
+    mono_deadline: Instant,
+    generation: u64,
+    token: Uuid,
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.mono_deadline
+            .cmp(&other.mono_deadline)
+            .then_with(|| self.generation.cmp(&other.generation))
+            .then_with(|| self.token.as_bytes().cmp(other.token.as_bytes()))
+    }
+}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Default)]
+struct Shard {
+    entries: HashMap<Uuid, Record>,
+    heap: BinaryHeap<Reverse<HeapEntry>>,
+    next_gen: u64,
+}
+
+impl Shard {
+    /// 弹出堆顶已过期的记录，返回本次从 `entries` 中真正移除的条目数
+    fn pop_expired_front(&mut self, now_secs: u64, now_instant: Instant) -> usize {
+        let mut removed = 0;
+        while let Some(&Reverse(top)) = self.heap.peek() {
+            let expired = match self.entries.get(&top.token) {
+                // 已被更新为新一代记录：直接丢弃过时的堆节点
+                Some(rec) if rec.generation != top.generation => {
+                    self.heap.pop();
+                    continue;
+                }
+                Some(rec) => rec.is_expired(now_secs, now_instant),
+                None => {
+                    self.heap.pop();
+                    continue;
+                }
+            };
+            if !expired {
+                break;
+            }
+            self.heap.pop();
+            if self.entries.remove(&top.token).is_some() {
+                removed += 1;
+            }
+        }
+        self.compact_heap_if_needed();
+        removed
+    }
+
+    /// 全量清理本分片内所有已过期记录（包括墙钟跳变导致堆序未覆盖到的条目）
+    fn purge_all_expired(&mut self, now_secs: u64, now_instant: Instant) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|_, rec| !rec.is_expired(now_secs, now_instant));
+        let removed = before - self.entries.len();
+        if removed > 0 || self.heap.len() > self.entries.len().saturating_mul(2) + 16 {
+            self.rebuild_heap();
+        }
+        removed
+    }
+
+    fn compact_heap_if_needed(&mut self) {
+        if self.heap.len() > self.entries.len().saturating_mul(2) + 32 {
+            self.rebuild_heap();
+        }
+    }
+
+    fn rebuild_heap(&mut self) {
+        self.heap.clear();
+        for (&token, rec) in &self.entries {
+            self.heap.push(Reverse(HeapEntry {
+                mono_deadline: rec.mono_deadline,
+                generation: rec.generation,
+                token,
+            }));
+        }
+    }
+
+    fn insert_or_overwrite(&mut self, token: Uuid, expire_at: u64, mono_deadline: Instant) {
+        self.next_gen = self.next_gen.wrapping_add(1);
+        let generation = self.next_gen;
+        self.entries.insert(
+            token,
+            Record {
+                generation,
+                expire_at,
+                mono_deadline,
+            },
+        );
+        self.heap.push(Reverse(HeapEntry {
+            mono_deadline,
+            generation,
+            token,
+        }));
+        self.compact_heap_if_needed();
+    }
+}
+
+/// 已使用 Token 的分片有界缓存
 ///
-/// key: 客户端送上来的 Token (UUID)
-/// value: 该 Token 的失效时间点(Unix 秒)，过了这个点 TOTP 本身就不会再接受它，
-///        所以缓存里也没有继续保留的必要。
+/// - **严格瞬时容量上限**：通过原子计数 `total_entries` 预占槽位，任何时刻条目数严格 `<= max_entries`
+/// - **绝不提前淘汰有效记录**：容量触顶时先精确回收过期记录；若全部为未过期记录则直接拒绝（fail-closed）
+/// - **均摊 O(1) 过期回收**：按分片最小堆渐进弹出过期项，消除周期性全表扫描造成的握手尾延迟毛刺
 pub struct ReplayGuard {
-    used: DashMap<Uuid, u64>,
-    /// 条目数上限
+    shards: Box<[Mutex<Shard>]>,
     max_entries: usize,
-    /// 上次按时间清理的时间点(节流用)
-    last_purge: AtomicU64,
-    /// 上次按容量裁剪的时间点(节流用)
-    last_trim: AtomicU64,
+    total_entries: AtomicUsize,
+    sweep_cursor: AtomicUsize,
+    max_monotonic_ttl: Duration,
 }
 
 impl Default for ReplayGuard {
@@ -57,13 +183,89 @@ impl ReplayGuard {
     }
 
     /// 以指定条目上限创建一个缓存(便于测试)
-    fn with_max_entries(max_entries: usize) -> Self {
-        let now = now_secs();
+    pub fn with_max_entries(max_entries: usize) -> Self {
+        Self::with_limits(max_entries, MAX_MONOTONIC_RETENTION)
+    }
+
+    fn with_limits(max_entries: usize, max_monotonic_ttl: Duration) -> Self {
+        let shards = (0..SHARD_COUNT)
+            .map(|_| Mutex::new(Shard::default()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
-            used: DashMap::new(),
+            shards,
             max_entries,
-            last_purge: AtomicU64::new(now),
-            last_trim: AtomicU64::new(now),
+            total_entries: AtomicUsize::new(0),
+            sweep_cursor: AtomicUsize::new(0),
+            max_monotonic_ttl,
+        }
+    }
+
+    /// 尝试消费一个 Token，返回详细结果。
+    pub fn try_consume(&self, token: &Uuid, expire_at: u64) -> Result<(), ReplayReject> {
+        if self.max_entries == 0 {
+            return Err(ReplayReject::CapacityExceeded);
+        }
+
+        let now = now_secs();
+        let now_instant = Instant::now();
+        let ttl = Duration::from_secs(expire_at.saturating_sub(now)).min(self.max_monotonic_ttl);
+        let mono_deadline = now_instant + ttl;
+
+        // 顺带渐进清理一个相邻分片的堆顶过期项，保证冷分片上的过期数据也能在 O(1) 内被回收
+        let target_idx = self.shard_index(token);
+        let sweep_idx = self.sweep_cursor.fetch_add(1, Ordering::Relaxed) % self.shards.len();
+        if sweep_idx != target_idx {
+            self.pop_shard_expired(sweep_idx, now, now_instant);
+        }
+
+        // 第一轮：在目标分片锁内检查重放并尝试预占槽位
+        {
+            let mut shard = self.lock_shard(target_idx);
+            let freed = shard.pop_expired_front(now, now_instant);
+            if freed > 0 {
+                self.total_entries.fetch_sub(freed, Ordering::Release);
+            }
+
+            if let Some(existing) = shard.entries.get(token) {
+                if !existing.is_expired(now, now_instant) {
+                    return Err(ReplayReject::Replay);
+                }
+                // 旧记录已过期：原地覆盖复用该槽位，total_entries 不变
+                shard.insert_or_overwrite(*token, expire_at, mono_deadline);
+                return Ok(());
+            }
+
+            if self.try_reserve_slot() {
+                shard.insert_or_overwrite(*token, expire_at, mono_deadline);
+                return Ok(());
+            }
+        }
+
+        // 容量触顶：先跨分片精确回收全部已过期项（释放目标分片锁后再按序扫描，避免死锁）
+        self.purge_expired_at(now, now_instant);
+
+        let mut shard = self.lock_shard(target_idx);
+        let freed = shard.pop_expired_front(now, now_instant);
+        if freed > 0 {
+            self.total_entries.fetch_sub(freed, Ordering::Release);
+        }
+
+        // 释放锁期间可能已有并发请求写入了同一个 Token，需重新检查
+        if let Some(existing) = shard.entries.get(token) {
+            if !existing.is_expired(now, now_instant) {
+                return Err(ReplayReject::Replay);
+            }
+            shard.insert_or_overwrite(*token, expire_at, mono_deadline);
+            return Ok(());
+        }
+
+        if self.try_reserve_slot() {
+            shard.insert_or_overwrite(*token, expire_at, mono_deadline);
+            Ok(())
+        } else {
+            // 所有槽位均被未过期的有效 Token 占满：fail-closed 拒绝，绝不淘汰有效防重放记录
+            Err(ReplayReject::CapacityExceeded)
         }
     }
 
@@ -71,89 +273,88 @@ impl ReplayGuard {
     ///
     /// - `expire_at`: 该 Token 在 TOTP 校验层面的最晚可用时间(Unix 秒)
     ///
-    /// 返回 `true` 表示这是第一次使用(放行)，`false` 表示重放(拒绝)。
+    /// 返回 `true` 表示首次使用且放行，`false` 表示重放或缓存满载被拒绝。
     pub fn try_use(&self, token: &Uuid, expire_at: u64) -> bool {
-        let now = now_secs();
-        self.purge_if_needed(now);
+        self.try_consume(token, expire_at).is_ok()
+    }
 
-        match self.used.entry(*token) {
-            // 已经记录过：只有旧记录本身已经过期才允许再次写入
-            Entry::Occupied(mut entry) => {
-                if *entry.get() <= now {
-                    entry.insert(expire_at);
-                    true
-                } else {
-                    false
-                }
+    /// 主动清理所有分片中已过期的记录，返回清理数量
+    pub fn purge_expired(&self) -> usize {
+        self.purge_expired_at(now_secs(), Instant::now())
+    }
+
+    fn purge_expired_at(&self, now_secs: u64, now_instant: Instant) -> usize {
+        let mut total_freed = 0;
+        for idx in 0..self.shards.len() {
+            let mut shard = self.lock_shard(idx);
+            let freed = shard.purge_all_expired(now_secs, now_instant);
+            if freed > 0 {
+                self.total_entries.fetch_sub(freed, Ordering::Release);
+                total_freed += freed;
             }
-            Entry::Vacant(entry) => {
-                entry.insert(expire_at);
-                true
+        }
+        total_freed
+    }
+
+    fn pop_shard_expired(&self, idx: usize, now_secs: u64, now_instant: Instant) {
+        if let Ok(mut shard) = self.shards[idx].try_lock() {
+            let freed = shard.pop_expired_front(now_secs, now_instant);
+            if freed > 0 {
+                self.total_entries.fetch_sub(freed, Ordering::Release);
             }
         }
     }
 
-    /// 维护缓存规模，分两级处理：
-    ///
-    /// 1. **按时间清理**：最多每 [`PURGE_INTERVAL`] 秒扫描一次，移除已经过期
-    ///    的记录。正常时钟下 Token 的失效时间只有几秒，这一步就足以让缓存规模
-    ///    维持在一个时间窗内，不会随握手次数增长。
-    /// 2. **按容量兜底**：如果时间清理没能压住规模(典型原因是系统时钟被回拨，
-    ///    导致 `expire_at > now` 恒成立)，缓存会顶到 [`MAX_CACHED_TOKENS`]。
-    ///    此时节流地丢弃最早失效的一半记录，保证内存有界。
-    ///
-    /// 两级都用时间戳节流，因此**不会**出现"缓存满了以后每次握手都全表扫描"
-    /// 的问题(那会把每次认证都变成 O(n))。
-    fn purge_if_needed(&self, now: u64) {
-        if self.try_acquire_turn(&self.last_purge, now, PURGE_INTERVAL) {
-            self.used.retain(|_, expire_at| *expire_at > now);
-        }
-
-        if self.used.len() >= self.max_entries
-            && self.try_acquire_turn(&self.last_trim, now, TRIM_INTERVAL)
-        {
-            self.trim_to_half();
+    #[inline]
+    fn try_reserve_slot(&self) -> bool {
+        let mut current = self.total_entries.load(Ordering::Acquire);
+        loop {
+            if current >= self.max_entries {
+                return false;
+            }
+            match self.total_entries.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
         }
     }
 
-    /// 节流：只有距上次执行超过 `interval` 且抢到执行权时才返回 true，
-    /// 保证同一时间只有一个线程做清理，且不会每个请求都触发。
-    fn try_acquire_turn(&self, last: &AtomicU64, now: u64, interval: u64) -> bool {
-        let previous = last.load(Ordering::Relaxed);
-        if now < previous.saturating_add(interval) {
-            return false;
-        }
-        last.compare_exchange(previous, now, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
+    #[inline]
+    fn shard_index(&self, token: &Uuid) -> usize {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        token.hash(&mut hasher);
+        (hasher.finish() as usize) & (self.shards.len() - 1)
     }
 
-    /// 丢弃最早失效的一半记录，把缓存规模拉回上限以下。
-    ///
-    /// 注意：这是内存有界优先的兜底手段，在时间清理失效的情况下会牺牲一部分
-    /// 窗口内的防重放能力，换取缓存不无限膨胀。
-    fn trim_to_half(&self) {
-        let mut deadlines: Vec<u64> = self.used.iter().map(|entry| *entry.value()).collect();
-        if deadlines.is_empty() {
-            return;
-        }
-        // 取失效时间的中位数作为截断点，保留较晚失效的那一半
-        let mid = deadlines.len() / 2;
-        let (_, cutoff, _) = deadlines.select_nth_unstable(mid);
-        let cutoff = *cutoff;
-        self.used.retain(|_, expire_at| *expire_at > cutoff);
+    #[inline]
+    fn lock_shard(&self, idx: usize) -> std::sync::MutexGuard<'_, Shard> {
+        self.shards[idx].lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// 当前缓存中的记录条数(含尚未清理的过期项)
+    /// 当前缓存中的记录条数(含尚未触发回收的过期项，严格 `<= max_entries`)
     pub fn len(&self) -> usize {
-        self.used.len()
+        self.total_entries.load(Ordering::Acquire)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.used.is_empty()
+        self.len() == 0
     }
 
     pub fn clear(&self) {
-        self.used.clear();
+        for idx in 0..self.shards.len() {
+            let mut shard = self.lock_shard(idx);
+            let removed = shard.entries.len();
+            shard.entries.clear();
+            shard.heap.clear();
+            if removed > 0 {
+                self.total_entries.fetch_sub(removed, Ordering::Release);
+            }
+        }
     }
 }
 
@@ -170,6 +371,8 @@ pub(crate) fn now_secs() -> u64 {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::sync::Arc;
+    use std::thread;
 
     #[test]
     fn test_reject_replay() {
@@ -177,11 +380,14 @@ mod test {
         let token = Uuid::new_v4();
         let expire_at = now_secs() + 30;
 
-        assert!(guard.try_use(&token, expire_at));
-        // 同一个 Token 再来一次必须被拒绝
-        assert!(!guard.try_use(&token, expire_at));
+        assert_eq!(guard.try_consume(&token, expire_at), Ok(()));
+        // 同一个 Token 再来一次必须被识别为 Replay
+        assert_eq!(
+            guard.try_consume(&token, expire_at),
+            Err(ReplayReject::Replay)
+        );
         // 其他 Token 不受影响
-        assert!(guard.try_use(&Uuid::new_v4(), expire_at));
+        assert_eq!(guard.try_consume(&Uuid::new_v4(), expire_at), Ok(()));
     }
 
     #[test]
@@ -196,77 +402,102 @@ mod test {
     }
 
     #[test]
-    fn test_purge_removes_expired() {
-        let guard = ReplayGuard::new();
+    fn test_purge_removes_expired_automatically_when_full() {
+        let guard = ReplayGuard::with_max_entries(16);
         let now = now_secs();
-        for _ in 0..100 {
-            guard.try_use(&Uuid::new_v4(), now.saturating_sub(1));
+        for _ in 0..16 {
+            assert!(guard.try_use(&Uuid::new_v4(), now.saturating_sub(1)));
         }
-        assert_eq!(guard.len(), 100);
 
-        // 强制触发一次清理
-        guard
-            .last_purge
-            .store(now.saturating_sub(PURGE_INTERVAL), Ordering::Relaxed);
-        guard.try_use(&Uuid::new_v4(), now + 30);
-        assert_eq!(guard.len(), 1);
-    }
-
-    #[test]
-    fn test_purge_is_throttled() {
-        let guard = ReplayGuard::new();
-        let now = now_secs();
-
-        // 让第一次调用可以清理
-        guard
-            .last_purge
-            .store(now.saturating_sub(PURGE_INTERVAL), Ordering::Relaxed);
-        assert!(guard.try_use(&Uuid::new_v4(), now + 30));
-        let after_first = guard.last_purge.load(Ordering::Relaxed);
-
-        // 紧接着的大量握手不应再触发全表扫描，
-        // 否则缓存一满，每次认证都会退化成 O(n)
-        for _ in 0..1000 {
+        // 再次写入未过期记录时，会自动精确回收已过期项并成功放入，无需等待固定时间节流窗口
+        for _ in 0..16 {
             assert!(guard.try_use(&Uuid::new_v4(), now + 30));
         }
-        assert_eq!(guard.last_purge.load(Ordering::Relaxed), after_first);
+        assert_eq!(guard.len(), 16);
     }
 
     #[test]
-    fn test_trim_to_half_evicts_earliest_deadlines() {
+    fn test_never_evicts_valid_records_under_same_deadline_saturation() {
+        // 同一 TOTP 时间窗内的所有 Token 具有完全相同的离散 expire_at；
+        // 满载时绝不能淘汰任何已消费的有效记录，且超过上限的新 Token 必须 fail-closed 拒绝。
         let guard = ReplayGuard::with_max_entries(10);
-        let now = now_secs();
-        for i in 0..10u64 {
-            assert!(guard.try_use(&Uuid::new_v4(), now + i + 1));
+        let shared_deadline = now_secs() + 20;
+        let mut recorded = Vec::new();
+
+        for _ in 0..10 {
+            let token = Uuid::new_v4();
+            assert_eq!(guard.try_consume(&token, shared_deadline), Ok(()));
+            recorded.push(token);
         }
         assert_eq!(guard.len(), 10);
 
-        guard.trim_to_half();
-
-        // 丢弃最早失效的一半，保留较晚失效的记录
-        assert!(
-            (4..=5).contains(&guard.len()),
-            "裁剪后应剩约一半，实际 {}",
-            guard.len()
+        // 第 11 个新 Token 因容量已满被拒绝，且长度严格不超过上限 10
+        assert_eq!(
+            guard.try_consume(&Uuid::new_v4(), shared_deadline),
+            Err(ReplayReject::CapacityExceeded)
         );
-        assert!(guard.used.iter().all(|entry| *entry.value() > now + 5));
+        assert_eq!(guard.len(), 10);
+
+        // 先前全部 10 个已消费 Token 仍然 100% 受到重放保护，没有任何一条被提前淘汰
+        for token in &recorded {
+            assert_eq!(
+                guard.try_consume(token, shared_deadline),
+                Err(ReplayReject::Replay)
+            );
+        }
     }
 
     #[test]
-    fn test_capacity_trim_keeps_cache_bounded() {
-        // 模拟"系统时钟被回拨导致时间清理失效"：所有记录都远未过期
-        let guard = ReplayGuard::with_max_entries(10);
-        let now = now_secs();
+    fn test_strict_instantaneous_cap_under_concurrency() {
+        let cap = 64;
+        let guard = Arc::new(ReplayGuard::with_max_entries(cap));
+        let expire_at = now_secs() + 60;
+        let accepted = Arc::new(AtomicUsize::new(0));
 
-        for i in 0..50u64 {
-            // 放开裁剪节流，验证容量兜底的效果
-            guard
-                .last_trim
-                .store(now.saturating_sub(TRIM_INTERVAL), Ordering::Relaxed);
-            assert!(guard.try_use(&Uuid::new_v4(), now + 3600 + i));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let g = guard.clone();
+            let acc = accepted.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..200 {
+                    if g.try_use(&Uuid::new_v4(), expire_at) {
+                        acc.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // 任意瞬时时刻都不能突破容量上限
+                    assert!(g.len() <= cap);
+                }
+            }));
         }
 
-        // 缓存规模被限制在上限以内，不会随写入次数线性增长
-        assert!(guard.len() <= 10, "缓存超过上限: {}", guard.len());
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(accepted.load(Ordering::Relaxed), cap);
+        assert_eq!(guard.len(), cap);
+    }
+
+    #[test]
+    fn test_monotonic_retention_recovers_from_clock_rollback() {
+        // 模拟系统墙钟被大幅回拨：expire_at 远在未来（now + 3600），
+        // 依靠单调时钟保留上限仍可自动过期恢复服务，无需牺牲防重放安全性。
+        let guard = ReplayGuard::with_limits(8, Duration::from_millis(40));
+        let far_future = now_secs() + 3600;
+
+        for _ in 0..8 {
+            assert!(guard.try_use(&Uuid::new_v4(), far_future));
+        }
+        assert_eq!(
+            guard.try_consume(&Uuid::new_v4(), far_future),
+            Err(ReplayReject::CapacityExceeded)
+        );
+
+        thread::sleep(Duration::from_millis(60));
+
+        // 单调时钟到期后缓存自动恢复可用
+        for _ in 0..8 {
+            assert_eq!(guard.try_consume(&Uuid::new_v4(), far_future), Ok(()));
+        }
+        assert_eq!(guard.len(), 8);
     }
 }
